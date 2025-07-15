@@ -90,7 +90,9 @@ UEI_DEFINE(uei);
 
 struct task_hint {
 	u64 hint;
-	u64 __reserved[3];
+	u32 cpu;
+	u32 llc;
+	u64 __reserved[2];
 };
 
 struct {
@@ -1201,6 +1203,7 @@ bool maybe_update_task_llc(struct task_struct *p, struct task_ctx *taskc, s32 ne
 
 s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
+	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	struct cpu_ctx *cpuc;
 	struct task_ctx *taskc;
 	struct layer *layer;
@@ -1219,7 +1222,9 @@ s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 	if (taskc->layer_id == MAX_LAYERS || !(layer = lookup_layer(taskc->layer_id)))
 		return prev_cpu;
 
-	if (layer->task_place == PLACEMENT_STICK)
+	if (task_hint && task_hint->cpu)
+		cpu = task_hint->cpu - 1;
+	else if (layer->task_place == PLACEMENT_STICK)
 		cpu = prev_cpu;
 	else
 		cpu = pick_idle_cpu(p, prev_cpu, cpuc, taskc, layer, true);
@@ -1396,6 +1401,7 @@ static void layer_kick_idle_cpu(struct layer *layer)
 
 void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	struct cpu_ctx *cpuc, *task_cpuc;
 	struct task_ctx *taskc;
 	struct llc_ctx *llcc;
@@ -1447,8 +1453,11 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * If select_cpu() was skipped, try direct dispatching to an idle CPU.
 	 */
-	if (!__COMPAT_is_enq_cpu_selected(enq_flags) || try_preempt_first) {
-		cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
+	if (!__COMPAT_is_enq_cpu_selected(enq_flags) || try_preempt_first || (task_hint && task_hint->cpu)) {
+		if (task_hint && task_hint->cpu)
+			cpu = task_hint->cpu - 1;
+		else
+			cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
 		if (cpu >= 0) {
 			lstat_inc(LSTAT_ENQ_LOCAL, layer, cpuc);
 			taskc->dsq_id = SCX_DSQ_LOCAL_ON | cpu;
@@ -2842,9 +2851,11 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 
 	task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	if (task_hint) {
+		/* Disable
 		u64 hint = task_hint->hint ?: 1;
 		hint = hint < 1024 ? hint : 1024;
 		runtime = (runtime * hint) / 1024;
+		*/
 	}
 
 	p->scx.dsq_vtime += runtime;
