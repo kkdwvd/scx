@@ -88,11 +88,22 @@ u32 nr_empty_layer_ids;
 
 UEI_DEFINE(uei);
 
+/* Force selection of a CPU within the specified LLC, even if idle CPUs are
+ * available elsewhere on the system.
+ */
+#define LLC_HARD_SELECT (1 << 0)
+/* Prefer finding an idle CPU in the hinted LLC, but be work conserving and pick
+ * any other idle CPU if available.
+ */
+#define LLC_SOFT_SELECT (1 << 1)
+
 struct task_hint {
 	u64 hint;
 	u32 cpu;
 	u32 llc;
-	u64 __reserved[2];
+	u32 llc_flags;
+	u32 __resvd;
+	u64 __reserved[1];
 };
 
 struct {
@@ -1201,6 +1212,34 @@ bool maybe_update_task_llc(struct task_struct *p, struct task_ctx *taskc, s32 ne
 	return true;
 }
 
+static void layer_kick_idle_cpu(struct layer *layer);
+
+static int pick_idle_cpu_hint(struct task_struct *p, u32 prev_cpu, struct cpu_ctx *cpuc,
+			      struct task_ctx *taskc, struct layer *layer, struct task_hint *hint,
+			      bool selcpu)
+{
+	const struct cpumask *idle_smtmask;
+	u32 llc_id = hint->llc - 1;
+	u32 flags = hint->llc_flags;
+	struct llc_ctx *llcc;
+	u32 cpu = -1;
+
+	if (llc_id > MAX_LLCS || !(idle_smtmask = scx_bpf_get_idle_smtmask()))
+		return cpu;
+	if (!(llcc = lookup_llc_ctx(llc_id)))
+		goto end;
+	cpu = pick_idle_cpu_from(cast_mask(llcc->cpumask), prev_cpu, idle_smtmask, layer);
+	if (cpu >= 0)
+		goto end;
+	if (flags & LLC_HARD_SELECT)
+		goto end;
+	if (flags & LLC_SOFT_SELECT)
+		cpu = pick_idle_cpu(p, prev_cpu, cpuc, taskc, layer, selcpu);
+end:
+	scx_bpf_put_idle_cpumask(idle_smtmask);
+	return cpu;
+}
+
 s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
@@ -1226,6 +1265,8 @@ s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 		cpu = task_hint->cpu - 1;
 	else if (layer->task_place == PLACEMENT_STICK)
 		cpu = prev_cpu;
+	else if (task_hint && task_hint->llc && task_hint->llc_flags)
+		cpu = pick_idle_cpu_hint(p, prev_cpu, cpuc, taskc, layer, task_hint, true);
 	else
 		cpu = pick_idle_cpu(p, prev_cpu, cpuc, taskc, layer, true);
 
@@ -1456,6 +1497,8 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	if (!__COMPAT_is_enq_cpu_selected(enq_flags) || try_preempt_first || (task_hint && task_hint->cpu)) {
 		if (task_hint && task_hint->cpu)
 			cpu = task_hint->cpu - 1;
+		else if (task_hint && task_hint->llc && task_hint->llc_flags)
+			cpu = pick_idle_cpu_hint(p, task_cpu, cpuc, taskc, layer, task_hint, false);
 		else
 			cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
 		if (cpu >= 0) {
@@ -1548,7 +1591,7 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	 * associated LLC and limit the amount of budget that an idling task can
 	 * accumulate to one slice.
 	 */
-	llc_id = task_cpuc->llc_id;
+	llc_id = task_hint ? task_hint->llc : task_cpuc->llc_id;
 	if (llc_id >= MAX_LLCS || !(llcc = lookup_llc_ctx(llc_id)))
 		return;
 
