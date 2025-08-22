@@ -1591,7 +1591,7 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	 * associated LLC and limit the amount of budget that an idling task can
 	 * accumulate to one slice.
 	 */
-	llc_id = task_hint ? task_hint->llc : task_cpuc->llc_id;
+	llc_id = task_hint && task_hint->llc ? task_hint->llc - 1 : task_cpuc->llc_id;
 	if (llc_id >= MAX_LLCS || !(llcc = lookup_llc_ctx(llc_id)))
 		return;
 
