@@ -7,7 +7,7 @@ use crate::Context;
 use crate::bpf::{BpfSkel, BpfSkelBuilder};
 use crate::bpf_intf::hints_event;
 use anyhow::{Context as _, Result, bail};
-use clap::Parser;
+use clap::{ArgAction, Parser, ValueEnum};
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::{MapCore, MapHandle, OpenObject, RingBufferBuilder};
 use serde::Serialize;
@@ -53,6 +53,16 @@ pub const PERF_SCHED_JSONL_FILE: &str = "perf.sched.jsonl";
 const DEFAULT_PERF_MMAP_SIZE: &str = "8M";
 const PERF_SCHED_CLOCKID: &str = "CLOCK_MONOTONIC";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RecordMode {
+    /// Record perf mem trace into perf.mem.data
+    Mem,
+    /// Record sched/irq trace events into perf.sched.data
+    Sched,
+    /// Record task hint updates into hints.jsonl
+    Hints,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     after_help = "Trace cost notes:\n  hints trace < mem trace < sched trace\n\n  sched trace produces a much higher volume of data than hints or mem trace and can be quite costly. On some workloads it can materially perturb the host, especially for longer recordings or when writing to slower / write-amplifying filesystems. Prefer shorter durations when sched trace is enabled."
@@ -74,11 +84,23 @@ pub struct RecordOpts {
     #[clap(short = 'l', long, default_value = "10")]
     pub ldlat: u32,
 
-    /// Path to the SCX scheduler's task hint map
+    /// Data sink to record. Repeat or comma-separate to enable multiple sinks
+    #[clap(
+        short = 'm',
+        long = "mode",
+        value_name = "MODE",
+        value_enum,
+        value_delimiter = ',',
+        action = ArgAction::Append,
+        required = true
+    )]
+    pub modes: Vec<RecordMode>,
+
+    /// Path to the SCX scheduler's task hint map for --mode hints
     #[clap(long)]
     pub hints_map: Option<PathBuf>,
 
-    /// Size of the hints ring buffer in MB
+    /// Size of the hints ring buffer in MB for --mode hints
     #[clap(long, default_value = "8")]
     pub hints_map_ring_sz: u32,
 
@@ -86,17 +108,15 @@ pub struct RecordOpts {
     #[clap(long)]
     pub disable_archive: bool,
 
-    /// Generate perf.mem.script and perf.sched.script during recording
+    /// Generate perf script files for recorded perf sinks during recording
     #[clap(long)]
     pub enable_perf_script: bool,
+}
 
-    /// Disable recording sched/irq trace events into perf.sched.data
-    #[clap(long)]
-    pub disable_sched_trace: bool,
-
-    /// Disable recording perf mem trace into perf.mem.data
-    #[clap(long)]
-    pub disable_mem_trace: bool,
+impl RecordOpts {
+    fn mode_enabled(&self, mode: RecordMode) -> bool {
+        self.modes.contains(&mode)
+    }
 }
 
 struct SpawnedProcess {
@@ -407,15 +427,13 @@ fn stop_hints_recorder(hints_recorder: &mut Option<HintsRecorder<'static>>) {
 }
 
 pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
+    validate_record_opts(&opts)?;
+
     if opts.output.exists() {
         bail!(
             "output directory '{}' already exists",
             opts.output.display()
         );
-    }
-
-    if opts.disable_archive && opts.file.is_some() {
-        bail!("--file cannot be used with --disable-archive");
     }
 
     fs::create_dir_all(&opts.output).context("failed to create output directory")?;
@@ -436,17 +454,19 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
     }
 
     if opts.enable_perf_script {
-        println!("Generating perf.mem.script...");
-        if let Err(e) = generate_perf_script(
-            ctx,
-            &opts.output.join(PERF_MEM_DATA_FILE),
-            &opts.output.join(PERF_MEM_SCRIPT_FILE),
-            PERF_MEM_SCRIPT_FIELDS,
-        ) {
-            eprintln!("warning: failed to generate perf.mem.script: {}", e);
+        if opts.mode_enabled(RecordMode::Mem) {
+            println!("Generating perf.mem.script...");
+            if let Err(e) = generate_perf_script(
+                ctx,
+                &opts.output.join(PERF_MEM_DATA_FILE),
+                &opts.output.join(PERF_MEM_SCRIPT_FILE),
+                PERF_MEM_SCRIPT_FIELDS,
+            ) {
+                eprintln!("warning: failed to generate perf.mem.script: {}", e);
+            }
         }
 
-        if !opts.disable_sched_trace && opts.output.join(PERF_SCHED_DATA_FILE).exists() {
+        if opts.mode_enabled(RecordMode::Sched) && opts.output.join(PERF_SCHED_DATA_FILE).exists() {
             println!("Generating perf.sched.script...");
             if let Err(e) = generate_perf_script(
                 ctx,
@@ -471,15 +491,35 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
     Ok(())
 }
 
-fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
-    let hints_trace_enabled = opts.hints_map.is_some();
-    if opts.disable_mem_trace && opts.disable_sched_trace && !hints_trace_enabled {
-        bail!("at least one of mem trace, sched trace, or hints trace must be enabled");
+fn validate_record_opts(opts: &RecordOpts) -> Result<()> {
+    if opts.modes.is_empty() {
+        bail!("at least one --mode must be specified");
     }
+
+    if opts.disable_archive && opts.file.is_some() {
+        bail!("--file cannot be used with --disable-archive");
+    }
+
+    let hints_trace_enabled = opts.mode_enabled(RecordMode::Hints);
+    if hints_trace_enabled && opts.hints_map.is_none() {
+        bail!("--mode hints requires --hints-map");
+    }
+
+    if !hints_trace_enabled && opts.hints_map.is_some() {
+        bail!("--hints-map can only be used with --mode hints");
+    }
+
+    Ok(())
+}
+
+fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
+    let mem_trace_enabled = opts.mode_enabled(RecordMode::Mem);
+    let sched_trace_enabled = opts.mode_enabled(RecordMode::Sched);
+    let hints_trace_enabled = opts.mode_enabled(RecordMode::Hints);
 
     let mut processes = Vec::new();
 
-    if !opts.disable_mem_trace {
+    if mem_trace_enabled {
         let perf_data_path = opts.output.join(PERF_MEM_DATA_FILE);
         let mem_perf_args = vec![
             perf_binary(),
@@ -498,17 +538,19 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
         processes.push(SpawnedProcess::spawn(&mem_perf_args)?);
     }
 
-    if !opts.disable_sched_trace {
+    if sched_trace_enabled {
         let sched_data_path = opts.output.join(PERF_SCHED_DATA_FILE);
         let sched_perf_args = build_sched_perf_args(&sched_data_path);
         processes.push(SpawnedProcess::spawn(&sched_perf_args)?);
     }
 
-    let hints_recorder = if opts.hints_map.is_some() {
+    let hints_recorder = if hints_trace_enabled {
         let hints_path = opts.output.join("hints.jsonl");
         Some(HintsRecorder::new(
             hints_path,
-            opts.hints_map.clone().unwrap(),
+            opts.hints_map
+                .clone()
+                .context("--mode hints requires --hints-map")?,
             opts.hints_map_ring_sz,
         )?)
     } else {
@@ -777,6 +819,41 @@ mod tests {
                 "missing sched trace event {event}"
             );
         }
+    }
+
+    #[test]
+    fn record_modes_are_explicit() {
+        let opts = RecordOpts::try_parse_from([
+            "record",
+            "-m",
+            "mem,sched",
+            "-m",
+            "hints",
+            "--hints-map",
+            "/sys/fs/bpf/scx/hints",
+        ])
+        .expect("expected record opts to parse");
+        assert_eq!(
+            opts.modes,
+            vec![RecordMode::Mem, RecordMode::Sched, RecordMode::Hints]
+        );
+        assert!(RecordOpts::try_parse_from(["record"]).is_err());
+
+        let opts = RecordOpts::try_parse_from(["record", "-m", "hints"]).unwrap();
+        let err = validate_record_opts(&opts).expect_err("hints need a map");
+        assert!(
+            err.to_string()
+                .contains("--mode hints requires --hints-map")
+        );
+
+        let opts =
+            RecordOpts::try_parse_from(["record", "-m", "mem", "--hints-map", "/sys/fs/bpf/m"])
+                .unwrap();
+        let err = validate_record_opts(&opts).expect_err("a map needs the hints mode");
+        assert!(
+            err.to_string()
+                .contains("--hints-map can only be used with --mode hints")
+        );
     }
 
     #[test]
