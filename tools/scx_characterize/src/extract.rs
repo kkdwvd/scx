@@ -19,7 +19,7 @@ const DEFAULT_WORKLOAD_ALLOTMENT_CGROUP_REGEX: &str = r"workload-tw-[^/]+\.allot
 
 #[derive(Debug, Parser)]
 pub struct ExtractMemOpts {
-    /// Path to perf.mem.jsonl file
+    /// Path to mem/perf.mem.jsonl file
     #[clap(short = 'f', long)]
     pub file: PathBuf,
 
@@ -48,9 +48,9 @@ pub struct ExtractOpts {
 
 #[derive(Debug, Subcommand)]
 pub enum ExtractCommand {
-    /// Extract workload cell config from perf.mem.jsonl
+    /// Extract workload cell config from mem/perf.mem.jsonl
     Mem(ExtractMemOpts),
-    /// Extract derived metrics from perf.sched.jsonl
+    /// Extract derived metrics from sched/perf.sched.jsonl
     Sched(ExtractSchedOpts),
 }
 
@@ -62,13 +62,13 @@ pub struct ExtractSchedOpts {
 
 #[derive(Debug, Subcommand)]
 pub enum ExtractSchedCommand {
-    /// Compute time-weighted CPU busy utilization from perf.sched.jsonl
+    /// Compute time-weighted CPU busy utilization from sched/perf.sched.jsonl
     Util(ExtractSchedUtilOpts),
 }
 
 #[derive(Debug, Parser)]
 pub struct ExtractSchedUtilOpts {
-    /// Path to perf.sched.jsonl file
+    /// Path to sched/perf.sched.jsonl file
     #[clap(short = 'f', long)]
     pub file: PathBuf,
 
@@ -459,7 +459,7 @@ struct CellConfig {
 }
 
 pub fn cmd_extract_mem(opts: ExtractMemOpts) -> Result<()> {
-    let file = File::open(&opts.file).context("failed to open perf.mem.jsonl")?;
+    let file = File::open(&opts.file).context("failed to open mem/perf.mem.jsonl")?;
     let reader = BufReader::new(file);
 
     let allotment_re =

@@ -4,9 +4,9 @@
 // GNU General Public License version 2.
 
 use crate::record::{
-    PERF_MEM_DATA_FILE, PERF_MEM_JSONL_FILE, PERF_MEM_SCRIPT_FIELDS, PERF_MEM_SCRIPT_FILE,
-    PERF_SCHED_DATA_FILE, PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS, PERF_SCHED_SCRIPT_FILE,
-    perf_binary, perf_script_output_exists, report_perf_script_stderr,
+    HINTS_JSONL_FILE, PERF_MEM_DATA_FILE, PERF_MEM_JSONL_FILE, PERF_MEM_SCRIPT_FIELDS,
+    PERF_MEM_SCRIPT_FILE, PERF_SCHED_DATA_FILE, PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS,
+    PERF_SCHED_SCRIPT_FILE, perf_binary, perf_script_output_exists, report_perf_script_stderr,
 };
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
@@ -129,7 +129,7 @@ trait HintAssignable {
 
 impl HintIndex {
     fn load_if_exists(profile_dir: &Path) -> Result<Option<Self>> {
-        let hints_path = profile_dir.join("hints.jsonl");
+        let hints_path = input_artifact_path(profile_dir, HINTS_JSONL_FILE);
         if !hints_path.exists() {
             return Ok(None);
         }
@@ -411,15 +411,17 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
 }
 
 fn copy_hints_if_present(profile_dir: &Path, output_dir: &Path) -> Result<()> {
-    let hints_src = profile_dir.join("hints.jsonl");
+    let hints_src = input_artifact_path(profile_dir, HINTS_JSONL_FILE);
     if !hints_src.exists() {
         return Ok(());
     }
 
-    let hints_dst = output_dir.join("hints.jsonl");
+    let hints_dst = output_dir.join(HINTS_JSONL_FILE);
+    create_parent_dir(&hints_dst)?;
     fs::copy(&hints_src, &hints_dst).with_context(|| {
         format!(
-            "failed to copy hints.jsonl from '{}' to '{}'",
+            "failed to copy {} from '{}' to '{}'",
+            HINTS_JSONL_FILE,
             hints_src.display(),
             hints_dst.display()
         )
@@ -432,8 +434,8 @@ fn prepare_trace_script_if_present(
     output_dir: &Path,
     artifacts: TraceArtifacts<'_>,
 ) -> Result<Option<PathBuf>> {
-    let perf_data_src = profile_dir.join(artifacts.data_file);
-    let perf_script_src = profile_dir.join(artifacts.script_file);
+    let perf_data_src = input_artifact_path(profile_dir, artifacts.data_file);
+    let mut perf_script_src = input_artifact_path(profile_dir, artifacts.script_file);
     let perf_script_dst = output_dir.join(artifacts.script_file);
 
     if !perf_script_src.exists() && !perf_data_src.exists() {
@@ -445,6 +447,8 @@ fn prepare_trace_script_if_present(
     }
 
     if !perf_script_src.exists() {
+        perf_script_src = profile_dir.join(artifacts.script_file);
+        create_parent_dir(&perf_script_src)?;
         println!(
             "Generating {} from {}...",
             artifacts.script_kind, artifacts.data_file
@@ -453,10 +457,31 @@ fn prepare_trace_script_if_present(
     }
 
     println!("Copying {}...", artifacts.script_kind);
+    create_parent_dir(&perf_script_dst)?;
     fs::copy(&perf_script_src, &perf_script_dst)
         .with_context(|| format!("failed to copy {}", artifacts.script_kind))?;
 
     Ok(Some(perf_script_dst))
+}
+
+fn input_artifact_path(profile_dir: &Path, artifact: &str) -> PathBuf {
+    let path = profile_dir.join(artifact);
+    if path.exists() {
+        return path;
+    }
+
+    match Path::new(artifact).file_name() {
+        Some(file_name) => profile_dir.join(file_name),
+        None => path,
+    }
+}
+
+fn create_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent directory '{}'", parent.display()))?;
+    }
+    Ok(())
 }
 
 fn prepare_profile_dir(path: &Path) -> Result<PathBuf> {
@@ -895,6 +920,7 @@ fn parse_perf_mem_script_to_jsonl(
         .with_context(|| format!("failed to open {}", artifacts.script_kind))?;
     let mut reader = BufReader::new(file);
 
+    create_parent_dir(output_path)?;
     let output_file = File::create(output_path)
         .with_context(|| format!("failed to create {}", artifacts.jsonl_kind))?;
     let mut writer = BufWriter::new(output_file);
@@ -973,6 +999,7 @@ fn parse_sched_perf_script_to_jsonl(
         .with_context(|| format!("failed to open {}", artifacts.script_kind))?;
     let mut reader = BufReader::new(file);
 
+    create_parent_dir(output_path)?;
     let output_file = File::create(output_path)
         .with_context(|| format!("failed to create {}", artifacts.jsonl_kind))?;
     let mut writer = BufWriter::new(output_file);
@@ -1027,11 +1054,16 @@ fn parse_sched_perf_script_to_jsonl(
 
 fn print_profile_contents(profile_dir: &Path) -> Result<()> {
     println!("Output contents:");
+    print_profile_contents_at(profile_dir, "")?;
+    Ok(())
+}
 
-    let entries: Vec<_> = std::fs::read_dir(profile_dir)
+fn print_profile_contents_at(profile_dir: &Path, prefix: &str) -> Result<()> {
+    let mut entries: Vec<_> = std::fs::read_dir(profile_dir)
         .context("failed to read profile directory")?
         .filter_map(|e| e.ok())
         .collect();
+    entries.sort_by_key(|entry| entry.file_name());
 
     if entries.is_empty() {
         println!("  (empty)");
@@ -1039,9 +1071,16 @@ fn print_profile_contents(profile_dir: &Path) -> Result<()> {
     }
 
     for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let display_name = format!("{prefix}{name}");
         let metadata = entry.metadata().ok();
         let size = metadata.map(|m| m.len()).unwrap_or(0);
-        println!("  {} ({} bytes)", entry.file_name().to_string_lossy(), size);
+        if entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+            println!("  {display_name}/");
+            print_profile_contents_at(&entry.path(), &format!("{display_name}/"))?;
+        } else {
+            println!("  {display_name} ({} bytes)", size);
+        }
     }
 
     Ok(())
@@ -1120,7 +1159,7 @@ mod tests {
         let sched_records: Vec<PerfSchedScriptRecord> =
             read_jsonl(&output_dir.join(PERF_SCHED_JSONL_FILE))?;
 
-        assert!(output_dir.join("hints.jsonl").exists());
+        assert!(output_dir.join(HINTS_JSONL_FILE).exists());
 
         let mem_hints: Vec<u64> = mem_records.iter().map(|record| record.hint).collect();
         let sched_hints: Vec<u64> = sched_records.iter().map(|record| record.hint).collect();

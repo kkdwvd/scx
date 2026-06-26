@@ -348,7 +348,7 @@ impl TraceStats {
 
     fn finish(&self) -> Result<(u64, usize)> {
         if !self.saw_switch {
-            anyhow::bail!("no sched:sched_switch events found in perf.sched.jsonl");
+            anyhow::bail!("no sched:sched_switch events found in sched/perf.sched.jsonl");
         }
         let end_ns = self.trace_end_ns.unwrap_or(0);
         let start_ns = self.trace_start_ns();
@@ -839,7 +839,7 @@ pub fn cmd_extract_sched_util(opts: ExtractSchedUtilOpts) -> Result<()> {
     }
 
     let categories = parse_sched_categories(&opts.categories)?;
-    let file = File::open(&opts.file).context("failed to open perf.sched.jsonl")?;
+    let file = File::open(&opts.file).context("failed to open sched/perf.sched.jsonl")?;
     let reader = BufReader::new(file);
 
     let mut stats = TraceStats::default();
@@ -854,7 +854,7 @@ pub fn cmd_extract_sched_util(opts: ExtractSchedUtilOpts) -> Result<()> {
         }
 
         let record: PerfSchedScriptRecord =
-            serde_json::from_str(&line).context("failed to parse perf.sched.jsonl record")?;
+            serde_json::from_str(&line).context("failed to parse sched/perf.sched.jsonl record")?;
         let Some(time_ns) = record
             .sample_time_ns()
             .or_else(|| sched_time_to_ns(record.time))

@@ -44,22 +44,23 @@ const SCHED_TRACE_EVENTS: &[&str] = &[
     "nmi:nmi_handler",
 ];
 
-pub const PERF_MEM_DATA_FILE: &str = "perf.mem.data";
-pub const PERF_MEM_SCRIPT_FILE: &str = "perf.mem.script";
-pub const PERF_MEM_JSONL_FILE: &str = "perf.mem.jsonl";
-pub const PERF_SCHED_DATA_FILE: &str = "perf.sched.data";
-pub const PERF_SCHED_SCRIPT_FILE: &str = "perf.sched.script";
-pub const PERF_SCHED_JSONL_FILE: &str = "perf.sched.jsonl";
+pub const PERF_MEM_DATA_FILE: &str = "mem/perf.mem.data";
+pub const PERF_MEM_SCRIPT_FILE: &str = "mem/perf.mem.script";
+pub const PERF_MEM_JSONL_FILE: &str = "mem/perf.mem.jsonl";
+pub const PERF_SCHED_DATA_FILE: &str = "sched/perf.sched.data";
+pub const PERF_SCHED_SCRIPT_FILE: &str = "sched/perf.sched.script";
+pub const PERF_SCHED_JSONL_FILE: &str = "sched/perf.sched.jsonl";
+pub const HINTS_JSONL_FILE: &str = "hints/hints.jsonl";
 const DEFAULT_PERF_MMAP_SIZE: &str = "8M";
 const PERF_SCHED_CLOCKID: &str = "CLOCK_MONOTONIC";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RecordMode {
-    /// Record perf mem trace into perf.mem.data
+    /// Record perf mem trace into mem/perf.mem.data
     Mem,
-    /// Record sched/irq trace events into perf.sched.data
+    /// Record sched/irq trace events into sched/perf.sched.data
     Sched,
-    /// Record task hint updates into hints.jsonl
+    /// Record task hint updates into hints/hints.jsonl
     Hints,
 }
 
@@ -84,7 +85,7 @@ pub struct RecordOpts {
     #[clap(short = 'l', long, default_value = "10")]
     pub ldlat: u32,
 
-    /// Data sink to record. Repeat or comma-separate to enable multiple sinks
+    /// Trace source to record. Repeat or comma-separate to enable multiple sources
     #[clap(
         short = 'm',
         long = "mode",
@@ -108,7 +109,7 @@ pub struct RecordOpts {
     #[clap(long)]
     pub disable_archive: bool,
 
-    /// Generate perf script files for recorded perf sinks during recording
+    /// Generate perf script files for recorded perf traces during recording
     #[clap(long)]
     pub enable_perf_script: bool,
 }
@@ -426,6 +427,14 @@ fn stop_hints_recorder(hints_recorder: &mut Option<HintsRecorder<'static>>) {
     }
 }
 
+fn create_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent directory '{}'", parent.display()))?;
+    }
+    Ok(())
+}
+
 pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
     validate_record_opts(&opts)?;
 
@@ -521,6 +530,7 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
 
     if mem_trace_enabled {
         let perf_data_path = opts.output.join(PERF_MEM_DATA_FILE);
+        create_parent_dir(&perf_data_path)?;
         let mem_perf_args = vec![
             perf_binary(),
             "mem".to_string(),
@@ -540,12 +550,14 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
 
     if sched_trace_enabled {
         let sched_data_path = opts.output.join(PERF_SCHED_DATA_FILE);
+        create_parent_dir(&sched_data_path)?;
         let sched_perf_args = build_sched_perf_args(&sched_data_path);
         processes.push(SpawnedProcess::spawn(&sched_perf_args)?);
     }
 
     let hints_recorder = if hints_trace_enabled {
-        let hints_path = opts.output.join("hints.jsonl");
+        let hints_path = opts.output.join(HINTS_JSONL_FILE);
+        create_parent_dir(&hints_path)?;
         Some(HintsRecorder::new(
             hints_path,
             opts.hints_map
@@ -569,8 +581,9 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
         if elapsed >= timeout {
             /*
              * Stop tracing hint updates before waiting for perf to flush and
-             * exit. Otherwise hints.jsonl keeps accumulating updates during
-             * perf teardown and no longer matches the perf capture window.
+             * exit. Otherwise hints/hints.jsonl keeps accumulating updates
+             * during perf teardown and no longer matches the perf capture
+             * window.
              */
             stop_hints_recorder(&mut hints_recorder);
             for process in &processes {
