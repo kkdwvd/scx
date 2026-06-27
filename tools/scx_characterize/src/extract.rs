@@ -16,6 +16,9 @@ use std::path::PathBuf;
 
 const DEFAULT_WORKLOAD_CGROUP_REGEX: &str = "workload.slice";
 const DEFAULT_WORKLOAD_ALLOTMENT_CGROUP_REGEX: &str = r"workload-tw-[^/]+\.allotment\.slice";
+const CONFIG_CLUSTER_SAMPLE_THRESHOLD_PCT: f64 = 5.0;
+const CONFIG_CLUSTER_PAGE_JACCARD_THRESHOLD: f64 = 0.20;
+const CONFIG_CLUSTER_PAGE_CONTAINMENT_THRESHOLD: f64 = 0.50;
 
 #[derive(Debug, Parser)]
 pub struct ExtractMemOpts {
@@ -51,7 +54,7 @@ pub struct ExtractMemOpts {
     #[clap(long, value_enum, default_value = "tid")]
     pub group_by: DispersionGroupBy,
 
-    /// Address identity for dispersion mode
+    /// Address identity for memory overlap metrics
     #[clap(long, value_enum, default_value = "phys")]
     pub address_space: DispersionAddressSpace,
 
@@ -59,7 +62,7 @@ pub struct ExtractMemOpts {
     #[clap(long)]
     pub comm_regex: Option<String>,
 
-    /// Minimum samples an entity must have in a window for pair metrics
+    /// Minimum samples a measured entity must have for overlap metrics
     #[clap(long, default_value = "2")]
     pub min_samples_per_entity: usize,
 
@@ -67,7 +70,7 @@ pub struct ExtractMemOpts {
     #[clap(long, default_value = "64")]
     pub cacheline_bytes: u64,
 
-    /// Page size in bytes for dispersion mode
+    /// Page size in bytes for memory overlap metrics
     #[clap(long, default_value = "4096")]
     pub page_bytes: u64,
 
@@ -256,15 +259,39 @@ impl GroupData {
 
 /// Result of clustering analysis for a group
 struct ClusterResult {
-    /// Comms that exceed the significance threshold, optionally with hint splits
-    significant_comms: Vec<CommCluster>,
+    /// Stable selector clusters that can be emitted in the config.
+    clusters: Vec<ConfigCluster>,
 }
 
-/// Clustering result for a single comm
-struct CommCluster {
-    name: String,
-    match_comms: Vec<String>,
-    significant_hints: Vec<u64>,
+#[derive(Debug, Clone)]
+struct ConfigCluster {
+    emit_keys: Vec<EmitKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct EmitKey {
+    comm: String,
+    hint: Option<u64>,
+}
+
+impl EmitKey {
+    fn comm(comm: String) -> Self {
+        Self { comm, hint: None }
+    }
+
+    fn comm_hint(comm: String, hint: u64) -> Self {
+        Self {
+            comm,
+            hint: Some(hint),
+        }
+    }
+
+    fn display_name(&self) -> String {
+        match self.hint {
+            Some(hint) => format!("{}@hint={hint}", self.comm),
+            None => self.comm.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +310,58 @@ struct GroupedCommSamples<'a> {
     concrete_counts: HashMap<String, u64>,
 }
 
+#[derive(Debug, Clone)]
+struct ConfigMeasurementNode {
+    emit_key: EmitKey,
+    sample_count: usize,
+    pages: BTreeSet<u64>,
+}
+
+impl ConfigMeasurementNode {
+    fn new(emit_key: EmitKey) -> Self {
+        Self {
+            emit_key,
+            sample_count: 0,
+            pages: BTreeSet::new(),
+        }
+    }
+
+    fn observe(&mut self, addr: u64, opts: &ExtractMemOpts) {
+        self.sample_count += 1;
+        self.pages.insert(addr / opts.page_bytes);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DisjointSet {
+    parent: Vec<usize>,
+}
+
+impl DisjointSet {
+    fn new(len: usize) -> Self {
+        Self {
+            parent: (0..len).collect(),
+        }
+    }
+
+    fn find(&mut self, idx: usize) -> usize {
+        let parent = self.parent[idx];
+        if parent != idx {
+            let root = self.find(parent);
+            self.parent[idx] = root;
+        }
+        self.parent[idx]
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let root_a = self.find(a);
+        let root_b = self.find(b);
+        if root_a != root_b {
+            self.parent[root_b] = root_a;
+        }
+    }
+}
+
 /// Group type for clustering decisions
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum GroupType {
@@ -296,47 +375,28 @@ enum GroupType {
 fn compute_clusters(
     group_type: GroupType,
     samples: &[&PerfMemRecord],
-    threshold_pct: f64,
-    use_hints: bool,
+    opts: &ExtractMemOpts,
 ) -> ClusterResult {
     // TODO(kkd): Enable clustering for Workload and Rest
     if group_type != GroupType::Allotment {
         return ClusterResult {
-            significant_comms: Vec::new(),
+            clusters: Vec::new(),
         };
     }
 
-    let total = samples.len();
-    let grouped_samples = group_samples_by_normalized_comm(samples);
-
-    let mut significant_comms = Vec::new();
-    if total > 0 {
-        for (cluster_name, group) in grouped_samples {
-            let count = group.samples.len() as u64;
-            let pct = (count as f64 / total as f64) * 100.0;
-            if pct > threshold_pct {
-                let significant_hints = if use_hints {
-                    compute_significant_hints(&group.samples, threshold_pct)
-                } else {
-                    Vec::new()
-                };
-                significant_comms.push(CommCluster {
-                    name: cluster_name.clone(),
-                    match_comms: group
-                        .concrete_counts
-                        .keys()
-                        .cloned()
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
-                    significant_hints,
-                });
-            }
-        }
+    let emit_groups =
+        significant_emit_groups(samples, CONFIG_CLUSTER_SAMPLE_THRESHOLD_PCT, opts.use_hints);
+    if emit_groups.is_empty() {
+        return ClusterResult {
+            clusters: Vec::new(),
+        };
     }
-    significant_comms.sort_by(|a, b| a.name.cmp(&b.name));
 
-    ClusterResult { significant_comms }
+    let emit_keys: Vec<_> = emit_groups.keys().cloned().collect();
+    let measurement_nodes = build_config_measurement_nodes(samples, &emit_groups, opts);
+    let clusters = cluster_emit_keys_by_overlap(&emit_keys, &measurement_nodes);
+
+    ClusterResult { clusters }
 }
 
 fn group_samples_by_normalized_comm<'a>(
@@ -367,28 +427,161 @@ fn normalize_comm_for_cluster(comm: &str) -> String {
     }
 }
 
-fn compute_significant_hints(samples: &[&PerfMemRecord], threshold_pct: f64) -> Vec<u64> {
-    let mut hint_counts: HashMap<u64, u64> = HashMap::new();
-    for sample in samples {
-        *hint_counts.entry(sample.hint).or_insert(0) += 1;
-    }
-
-    if hint_counts.len() <= 1 {
-        return Vec::new();
-    }
-
+fn significant_emit_groups<'a>(
+    samples: &[&'a PerfMemRecord],
+    threshold_pct: f64,
+    use_hints: bool,
+) -> BTreeMap<EmitKey, Vec<&'a PerfMemRecord>> {
     let total = samples.len();
-    let mut significant_hints = Vec::new();
-    if total > 0 {
-        for (hint, count) in hint_counts {
-            let pct = (count as f64 / total as f64) * 100.0;
-            if pct > threshold_pct {
-                significant_hints.push(hint);
+    if total == 0 {
+        return BTreeMap::new();
+    }
+
+    let threshold_count = ((total as f64) * threshold_pct / 100.0).ceil() as usize;
+    let grouped_samples = group_samples_by_normalized_comm(samples);
+    let mut emit_groups = BTreeMap::new();
+
+    for (comm, group) in grouped_samples {
+        if group.samples.len() < threshold_count {
+            continue;
+        }
+
+        if use_hints && group.hint_counts.len() > 1 {
+            let mut hint_samples: BTreeMap<u64, Vec<&PerfMemRecord>> = BTreeMap::new();
+            for sample in group.samples {
+                hint_samples.entry(sample.hint).or_default().push(sample);
+            }
+
+            for (hint, samples) in hint_samples {
+                if samples.len() >= threshold_count {
+                    emit_groups.insert(EmitKey::comm_hint(comm.clone(), hint), samples);
+                }
+            }
+        } else {
+            emit_groups.insert(EmitKey::comm(comm), group.samples);
+        }
+    }
+
+    emit_groups
+}
+
+fn build_config_measurement_nodes(
+    samples: &[&PerfMemRecord],
+    emit_groups: &BTreeMap<EmitKey, Vec<&PerfMemRecord>>,
+    opts: &ExtractMemOpts,
+) -> Vec<ConfigMeasurementNode> {
+    let emit_keys: BTreeSet<_> = emit_groups.keys().cloned().collect();
+    let mut nodes: BTreeMap<(EmitKey, u32), ConfigMeasurementNode> = BTreeMap::new();
+
+    for sample in samples {
+        let Some(emit_key) = config_emit_key_for_sample(sample, &emit_keys, opts.use_hints) else {
+            continue;
+        };
+        let Some(addr) = dispersion_addr(sample, opts.address_space) else {
+            continue;
+        };
+        if addr == 0 {
+            continue;
+        }
+
+        nodes
+            .entry((emit_key.clone(), sample.tid))
+            .or_insert_with(|| ConfigMeasurementNode::new(emit_key))
+            .observe(addr, opts);
+    }
+
+    nodes
+        .into_values()
+        .filter(|node| node.sample_count >= opts.min_samples_per_entity && !node.pages.is_empty())
+        .collect()
+}
+
+fn config_emit_key_for_sample(
+    sample: &PerfMemRecord,
+    emit_keys: &BTreeSet<EmitKey>,
+    use_hints: bool,
+) -> Option<EmitKey> {
+    let comm = normalize_comm_for_cluster(&sample.comm);
+    if use_hints {
+        let hinted_key = EmitKey::comm_hint(comm.clone(), sample.hint);
+        if emit_keys.contains(&hinted_key) {
+            return Some(hinted_key);
+        }
+    }
+
+    let comm_key = EmitKey::comm(comm);
+    emit_keys.contains(&comm_key).then_some(comm_key)
+}
+
+fn cluster_emit_keys_by_overlap(
+    emit_keys: &[EmitKey],
+    measurement_nodes: &[ConfigMeasurementNode],
+) -> Vec<ConfigCluster> {
+    let mut key_index = BTreeMap::new();
+    for (idx, key) in emit_keys.iter().enumerate() {
+        key_index.insert(key.clone(), idx);
+    }
+
+    let mut measured_dsu = DisjointSet::new(measurement_nodes.len());
+    for i in 0..measurement_nodes.len() {
+        for j in i + 1..measurement_nodes.len() {
+            if config_nodes_share_pages(&measurement_nodes[i], &measurement_nodes[j]) {
+                measured_dsu.union(i, j);
             }
         }
     }
-    significant_hints.sort_unstable();
-    significant_hints
+
+    let mut key_dsu = DisjointSet::new(emit_keys.len());
+    let mut measured_components: BTreeMap<usize, BTreeSet<EmitKey>> = BTreeMap::new();
+    for (idx, node) in measurement_nodes.iter().enumerate() {
+        let root = measured_dsu.find(idx);
+        measured_components
+            .entry(root)
+            .or_default()
+            .insert(node.emit_key.clone());
+    }
+
+    for keys in measured_components.values() {
+        let mut iter = keys.iter();
+        let Some(first) = iter.next() else {
+            continue;
+        };
+        let first_idx = key_index[first];
+        for key in iter {
+            key_dsu.union(first_idx, key_index[key]);
+        }
+    }
+
+    let mut clustered_keys: BTreeMap<usize, BTreeSet<EmitKey>> = BTreeMap::new();
+    for (idx, key) in emit_keys.iter().enumerate() {
+        let root = key_dsu.find(idx);
+        clustered_keys.entry(root).or_default().insert(key.clone());
+    }
+
+    clustered_keys
+        .into_values()
+        .map(|keys| ConfigCluster {
+            emit_keys: keys.into_iter().collect(),
+        })
+        .collect()
+}
+
+fn config_nodes_share_pages(a: &ConfigMeasurementNode, b: &ConfigMeasurementNode) -> bool {
+    if a.pages.is_empty() || b.pages.is_empty() {
+        return false;
+    }
+
+    let intersection = a.pages.intersection(&b.pages).count();
+    if intersection == 0 {
+        return false;
+    }
+
+    let union = a.pages.len() + b.pages.len() - intersection;
+    let jaccard = intersection as f64 / union as f64;
+    let containment = intersection as f64 / a.pages.len().min(b.pages.len()) as f64;
+
+    jaccard >= CONFIG_CLUSTER_PAGE_JACCARD_THRESHOLD
+        || containment >= CONFIG_CLUSTER_PAGE_CONTAINMENT_THRESHOLD
 }
 
 fn summarize_comm_groups(samples: &[&PerfMemRecord]) -> Vec<CommSummary> {
@@ -415,28 +608,18 @@ fn summarize_comm_groups(samples: &[&PerfMemRecord]) -> Vec<CommSummary> {
 
 /// Build subcells from clustering result. Returns empty if no significant comms.
 fn build_subcells_from_clusters(result: &ClusterResult) -> Vec<CellSpec> {
-    if result.significant_comms.is_empty() {
+    if result.clusters.is_empty() {
         return Vec::new();
     }
 
     let mut subcells = Vec::new();
 
-    for comm in &result.significant_comms {
-        if comm.significant_hints.is_empty() {
-            subcells.push(CellSpec {
-                name: comm.name.clone(),
-                matches: CellMatches::complex(build_comm_match_clauses(comm, None)),
-                subcells: Vec::new(),
-            });
-        } else {
-            for hint in &comm.significant_hints {
-                subcells.push(CellSpec {
-                    name: format!("{}@hint={hint}", comm.name),
-                    matches: CellMatches::complex(build_comm_match_clauses(comm, Some(*hint))),
-                    subcells: Vec::new(),
-                });
-            }
-        }
+    for cluster in &result.clusters {
+        subcells.push(CellSpec {
+            name: config_cluster_name(cluster),
+            matches: CellMatches::complex(build_emit_key_match_clauses(&cluster.emit_keys)),
+            subcells: Vec::new(),
+        });
     }
 
     subcells.push(CellSpec {
@@ -448,33 +631,26 @@ fn build_subcells_from_clusters(result: &ClusterResult) -> Vec<CellSpec> {
     subcells
 }
 
-fn build_comm_match_clauses(comm: &CommCluster, hint: Option<u64>) -> Vec<Vec<CellMatch>> {
-    let comm_patterns = emitted_comm_patterns(comm);
-
-    comm_patterns
+fn config_cluster_name(cluster: &ConfigCluster) -> String {
+    cluster
+        .emit_keys
         .iter()
-        .map(|exact_comm| {
-            let mut clause = vec![CellMatch::CommPrefix(exact_comm.clone())];
-            if let Some(hint) = hint {
+        .map(EmitKey::display_name)
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+fn build_emit_key_match_clauses(emit_keys: &[EmitKey]) -> Vec<Vec<CellMatch>> {
+    emit_keys
+        .iter()
+        .map(|emit_key| {
+            let mut clause = vec![CellMatch::CommPrefix(emit_key.comm.clone())];
+            if let Some(hint) = emit_key.hint {
                 clause.push(CellMatch::Hint(hint));
             }
             clause
         })
         .collect()
-}
-
-fn emitted_comm_patterns(comm: &CommCluster) -> Vec<String> {
-    if comm.match_comms.len() > 1
-        && !comm.name.is_empty()
-        && comm
-            .match_comms
-            .iter()
-            .all(|match_comm| match_comm.starts_with(&comm.name))
-    {
-        vec![comm.name.clone()]
-    } else {
-        comm.match_comms.clone()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -597,7 +773,7 @@ fn cmd_extract_mem_config(opts: ExtractMemOpts) -> Result<()> {
         &group_names,
         workload_cgroup,
         &opts.workload_allotment_cgroup_regex,
-        opts.use_hints,
+        &opts,
     );
     let json = serde_json::to_string_pretty(&config).context("failed to serialize config")?;
     println!("{}", json);
@@ -1126,7 +1302,7 @@ fn generate_config(
     group_names: &[String],
     workload_cgroup: &str,
     allotment_regex: &str,
-    use_hints: bool,
+    opts: &ExtractMemOpts,
 ) -> CellConfig {
     let mut specs = Vec::new();
 
@@ -1158,7 +1334,7 @@ fn generate_config(
             continue;
         }
 
-        let clusters = compute_clusters(group_type, &samples, 5.0, use_hints);
+        let clusters = compute_clusters(group_type, &samples, opts);
         let subcells = build_subcells_from_clusters(&clusters);
 
         let matches = match group_type {
@@ -1204,6 +1380,30 @@ mod tests {
         .expect("failed to build PerfMemRecord test sample")
     }
 
+    fn sample_with_tid_addr(
+        comm: &str,
+        cgroup: &str,
+        hint: u64,
+        tid: u32,
+        addr: u64,
+    ) -> PerfMemRecord {
+        serde_json::from_value(json!({
+            "comm": comm,
+            "tid": tid,
+            "pid": 1,
+            "time": "0",
+            "addr": format!("{addr:x}"),
+            "cgroup": cgroup,
+            "ip": "0",
+            "sym": "sym",
+            "dso": "dso",
+            "phys_addr": format!("{addr:x}"),
+            "data_page_size": 4096,
+            "hint": hint,
+        }))
+        .expect("failed to build PerfMemRecord test sample")
+    }
+
     fn dispersion_opts() -> ExtractMemOpts {
         ExtractMemOpts {
             file: PathBuf::from("unused"),
@@ -1225,6 +1425,13 @@ mod tests {
             hugepage_weight: 0.05,
             emit_pairs: false,
         }
+    }
+
+    fn config_opts(use_hints: bool) -> ExtractMemOpts {
+        let mut opts = dispersion_opts();
+        opts.mode = ExtractMemMode::Config;
+        opts.use_hints = use_hints;
+        opts
     }
 
     fn dispersion_entity_samples(addrs: &[u64], opts: &ExtractMemOpts) -> DispersionEntitySamples {
@@ -1250,6 +1457,35 @@ mod tests {
         }
     }
 
+    fn push_addr_samples(
+        groups: &mut HashMap<String, GroupData>,
+        group: &str,
+        comm: &str,
+        hint: u64,
+        tid: u32,
+        page_addr: u64,
+        count: usize,
+    ) {
+        let data = groups
+            .entry(group.to_string())
+            .or_insert_with(GroupData::new);
+        for idx in 0..count {
+            let addr = page_addr + ((idx as u64 % 16) * 64);
+            data.push(sample_with_tid_addr(comm, group, hint, tid, addr));
+        }
+    }
+
+    fn generate_test_config(
+        groups: &HashMap<String, GroupData>,
+        group_names: &[String],
+        workload_cgroup: &str,
+        allotment_regex: &str,
+        use_hints: bool,
+    ) -> CellConfig {
+        let opts = config_opts(use_hints);
+        generate_config(groups, group_names, workload_cgroup, allotment_regex, &opts)
+    }
+
     #[test]
     fn mem_extract_does_not_split_comms_by_hint_without_flag() {
         let allotment = "workload-tw-foo.allotment.slice";
@@ -1262,7 +1498,8 @@ mod tests {
         push_samples(&mut groups, allotment, "beta", 0, 10);
 
         let group_names = vec![allotment.to_string()];
-        let config = generate_config(&groups, &group_names, workload, "allotment-regex", false);
+        let config =
+            generate_test_config(&groups, &group_names, workload, "allotment-regex", false);
 
         let allotment_spec = &config.specs[0];
         let alpha = allotment_spec
@@ -1286,7 +1523,7 @@ mod tests {
         push_samples(&mut groups, allotment, "beta", 0, 10);
 
         let group_names = vec![allotment.to_string()];
-        let config = generate_config(&groups, &group_names, workload, "allotment-regex", true);
+        let config = generate_test_config(&groups, &group_names, workload, "allotment-regex", true);
 
         let allotment_spec = &config.specs[0];
         let alpha_hint_0 = allotment_spec
@@ -1352,7 +1589,8 @@ mod tests {
         ];
         group_names.sort();
 
-        let config = generate_config(&groups, &group_names, workload, "allotment-regex", false);
+        let config =
+            generate_test_config(&groups, &group_names, workload, "allotment-regex", false);
 
         let allotment_spec = config
             .specs
@@ -1398,7 +1636,8 @@ mod tests {
         push_samples(&mut groups, allotment, "beta", 0, 92);
 
         let group_names = vec![allotment.to_string()];
-        let config = generate_config(&groups, &group_names, workload, "allotment-regex", false);
+        let config =
+            generate_test_config(&groups, &group_names, workload, "allotment-regex", false);
 
         let allotment_spec = &config.specs[0];
         let merged = allotment_spec
@@ -1422,19 +1661,114 @@ mod tests {
     }
 
     #[test]
+    fn mem_extract_clusters_comms_with_overlapping_working_sets() {
+        let allotment = "workload-tw-foo.allotment.slice";
+        let workload = "workload.slice";
+
+        let mut groups = HashMap::new();
+        push_addr_samples(&mut groups, allotment, "alpha", 0, 10, 0x1000, 50);
+        push_addr_samples(&mut groups, allotment, "beta", 0, 20, 0x1000, 50);
+
+        let group_names = vec![allotment.to_string()];
+        let config =
+            generate_test_config(&groups, &group_names, workload, "allotment-regex", false);
+
+        let allotment_spec = &config.specs[0];
+        let cluster = allotment_spec
+            .subcells
+            .iter()
+            .find(|spec| spec.name == "alpha+beta")
+            .expect("missing overlap cluster");
+
+        assert_eq!(
+            cluster.matches,
+            CellMatches::complex(vec![
+                vec![CellMatch::CommPrefix("alpha".to_string())],
+                vec![CellMatch::CommPrefix("beta".to_string())],
+            ])
+        );
+        assert!(
+            allotment_spec
+                .subcells
+                .iter()
+                .all(|spec| spec.name != "alpha" && spec.name != "beta")
+        );
+    }
+
+    #[test]
+    fn mem_extract_ignores_overlapping_comms_below_sample_threshold() {
+        let allotment = "workload-tw-foo.allotment.slice";
+        let workload = "workload.slice";
+
+        let mut groups = HashMap::new();
+        push_addr_samples(&mut groups, allotment, "alpha", 0, 10, 0x1000, 96);
+        push_addr_samples(&mut groups, allotment, "beta", 0, 20, 0x1000, 4);
+
+        let group_names = vec![allotment.to_string()];
+        let config =
+            generate_test_config(&groups, &group_names, workload, "allotment-regex", false);
+
+        let allotment_spec = &config.specs[0];
+        assert!(
+            allotment_spec
+                .subcells
+                .iter()
+                .any(|spec| spec.name == "alpha")
+        );
+        assert!(
+            allotment_spec
+                .subcells
+                .iter()
+                .all(|spec| spec.name != "beta" && spec.name != "alpha+beta")
+        );
+    }
+
+    #[test]
+    fn mem_extract_merges_numeric_suffix_comms_even_when_working_sets_differ() {
+        let allotment = "workload-tw-foo.allotment.slice";
+        let workload = "workload.slice";
+
+        let mut groups = HashMap::new();
+        push_addr_samples(&mut groups, allotment, "worker0", 0, 10, 0x1000, 50);
+        push_addr_samples(&mut groups, allotment, "worker1", 0, 20, 0x20_0000, 50);
+
+        let group_names = vec![allotment.to_string()];
+        let config =
+            generate_test_config(&groups, &group_names, workload, "allotment-regex", false);
+
+        let allotment_spec = &config.specs[0];
+        let worker = allotment_spec
+            .subcells
+            .iter()
+            .find(|spec| spec.name == "worker")
+            .expect("missing normalized worker subcell");
+
+        assert_eq!(
+            worker.matches,
+            CellMatches::complex(vec![vec![CellMatch::CommPrefix("worker".to_string())]])
+        );
+        assert!(
+            allotment_spec
+                .subcells
+                .iter()
+                .all(|spec| spec.name != "worker0" && spec.name != "worker1")
+        );
+    }
+
+    #[test]
     fn mem_extract_splits_merged_numeric_suffix_comm_by_hint_with_flag() {
         let allotment = "workload-tw-foo.allotment.slice";
         let workload = "workload.slice";
 
         let mut groups = HashMap::new();
-        push_samples(&mut groups, allotment, "mcrpxy-webNR1", 0, 3);
-        push_samples(&mut groups, allotment, "mcrpxy-webNR1", 7, 1);
-        push_samples(&mut groups, allotment, "mcrpxy-webNR2", 7, 3);
-        push_samples(&mut groups, allotment, "mcrpxy-webNR2", 9, 1);
-        push_samples(&mut groups, allotment, "beta", 0, 92);
+        push_samples(&mut groups, allotment, "mcrpxy-webNR1", 0, 8);
+        push_samples(&mut groups, allotment, "mcrpxy-webNR1", 7, 2);
+        push_samples(&mut groups, allotment, "mcrpxy-webNR2", 7, 8);
+        push_samples(&mut groups, allotment, "mcrpxy-webNR2", 9, 10);
+        push_samples(&mut groups, allotment, "beta", 0, 72);
 
         let group_names = vec![allotment.to_string()];
-        let config = generate_config(&groups, &group_names, workload, "allotment-regex", true);
+        let config = generate_test_config(&groups, &group_names, workload, "allotment-regex", true);
 
         let allotment_spec = &config.specs[0];
         let merged_hint_0 = allotment_spec
