@@ -5,11 +5,11 @@
 
 use crate::process::PerfMemRecord;
 use crate::sched_util::cmd_extract_sched_util;
-use anyhow::{Context as _, Result};
-use clap::{ArgAction, Parser, Subcommand};
+use anyhow::{Context as _, Result, bail};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use regex::Regex;
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -22,6 +22,10 @@ pub struct ExtractMemOpts {
     /// Path to mem/perf.mem.jsonl file
     #[clap(short = 'f', long)]
     pub file: PathBuf,
+
+    /// Memory extraction mode
+    #[clap(short = 'm', long, value_enum, default_value = "config")]
+    pub mode: ExtractMemMode,
 
     /// Regex pattern for workload cgroup
     #[clap(long, default_value = DEFAULT_WORKLOAD_CGROUP_REGEX)]
@@ -38,6 +42,82 @@ pub struct ExtractMemOpts {
     /// Verbosity level (-v for summary, -vv for detailed output)
     #[clap(short, long, action = ArgAction::Count)]
     pub verbose: u8,
+
+    /// Window sizes in milliseconds for dispersion mode
+    #[clap(long, value_delimiter = ',', default_value = "100,1000,5000")]
+    pub window_ms: Vec<u64>,
+
+    /// Entity grouping for dispersion mode
+    #[clap(long, value_enum, default_value = "tid")]
+    pub group_by: DispersionGroupBy,
+
+    /// Address identity for dispersion mode
+    #[clap(long, value_enum, default_value = "phys")]
+    pub address_space: DispersionAddressSpace,
+
+    /// Regex filter for sampled command names in dispersion mode
+    #[clap(long)]
+    pub comm_regex: Option<String>,
+
+    /// Minimum samples an entity must have in a window for pair metrics
+    #[clap(long, default_value = "2")]
+    pub min_samples_per_entity: usize,
+
+    /// Cacheline size in bytes for dispersion mode
+    #[clap(long, default_value = "64")]
+    pub cacheline_bytes: u64,
+
+    /// Page size in bytes for dispersion mode
+    #[clap(long, default_value = "4096")]
+    pub page_bytes: u64,
+
+    /// Huge page size in bytes for dispersion mode
+    #[clap(long, default_value = "2097152")]
+    pub hugepage_bytes: u64,
+
+    /// Distance scale in bytes for same-page exponential overlap decay
+    #[clap(long, default_value = "256")]
+    pub page_decay_bytes: f64,
+
+    /// Distance scale in bytes for same-hugepage exponential overlap decay
+    #[clap(long, default_value = "65536")]
+    pub hugepage_decay_bytes: f64,
+
+    /// Maximum contribution for same-hugepage overlap when page overlap is absent
+    #[clap(long, default_value = "0.05")]
+    pub hugepage_weight: f64,
+
+    /// Emit per-pair dispersion records in addition to window summaries
+    #[clap(long)]
+    pub emit_pairs: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExtractMemMode {
+    /// Generate scx_layered cell config from memory samples
+    Config,
+    /// Compute sampled working-set overlap and dispersion metrics
+    Dispersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DispersionGroupBy {
+    /// Group samples by thread id
+    Tid,
+    /// Group samples by process id
+    Pid,
+    /// Group samples by command name
+    Comm,
+    /// Group samples by command name and hint value
+    CommHint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DispersionAddressSpace {
+    /// Use sampled physical addresses for LLC working-set identity
+    Phys,
+    /// Use sampled virtual addresses for single-process synthetic validation
+    Virt,
 }
 
 #[derive(Debug, Parser)]
@@ -48,7 +128,7 @@ pub struct ExtractOpts {
 
 #[derive(Debug, Subcommand)]
 pub enum ExtractCommand {
-    /// Extract workload cell config from mem/perf.mem.jsonl
+    /// Extract memory-derived summaries from mem/perf.mem.jsonl
     Mem(ExtractMemOpts),
     /// Extract derived metrics from sched/perf.sched.jsonl
     Sched(ExtractSchedOpts),
@@ -459,6 +539,13 @@ struct CellConfig {
 }
 
 pub fn cmd_extract_mem(opts: ExtractMemOpts) -> Result<()> {
+    match opts.mode {
+        ExtractMemMode::Config => cmd_extract_mem_config(opts),
+        ExtractMemMode::Dispersion => cmd_extract_mem_dispersion(opts),
+    }
+}
+
+fn cmd_extract_mem_config(opts: ExtractMemOpts) -> Result<()> {
     let file = File::open(&opts.file).context("failed to open mem/perf.mem.jsonl")?;
     let reader = BufReader::new(file);
 
@@ -516,6 +603,509 @@ pub fn cmd_extract_mem(opts: ExtractMemOpts) -> Result<()> {
     println!("{}", json);
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct DispersionSample {
+    entity: String,
+    time_ns: u64,
+    addr: u64,
+}
+
+#[derive(Debug, Default)]
+struct DispersionEntitySamples {
+    addrs: Vec<u64>,
+    lines: BTreeSet<u64>,
+    pages: BTreeSet<u64>,
+    hugepages: BTreeSet<u64>,
+}
+
+impl DispersionEntitySamples {
+    fn observe(&mut self, addr: u64, opts: &ExtractMemOpts) {
+        self.addrs.push(addr);
+        self.lines.insert(addr / opts.cacheline_bytes);
+        self.pages.insert(addr / opts.page_bytes);
+        self.hugepages.insert(addr / opts.hugepage_bytes);
+    }
+
+    fn sample_count(&self) -> usize {
+        self.addrs.len()
+    }
+
+    fn observed_line_wss_bytes(&self, opts: &ExtractMemOpts) -> u64 {
+        self.lines.len() as u64 * opts.cacheline_bytes
+    }
+
+    fn observed_page_wss_bytes(&self, opts: &ExtractMemOpts) -> u64 {
+        self.pages.len() as u64 * opts.page_bytes
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DispersionSummaryRecord {
+    kind: &'static str,
+    window_ms: u64,
+    window_start_ns: u64,
+    window_end_ns: u64,
+    entity_count: usize,
+    pair_count: u64,
+    sample_count: usize,
+    access_pair_count: u64,
+    mean_entity_line_wss_bytes: f64,
+    mean_entity_page_wss_bytes: f64,
+    union_line_wss_bytes: u64,
+    union_page_wss_bytes: u64,
+    mean_line_overlap: f64,
+    mean_page_proximity: f64,
+    mean_hugepage_proximity: f64,
+    mean_weighted_overlap: f64,
+    mean_dispersion: f64,
+    access_weighted_overlap: f64,
+    access_weighted_dispersion: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DispersionPairRecord {
+    kind: &'static str,
+    window_ms: u64,
+    window_start_ns: u64,
+    window_end_ns: u64,
+    entity_a: String,
+    entity_b: String,
+    samples_a: usize,
+    samples_b: usize,
+    observed_line_wss_bytes_a: u64,
+    observed_line_wss_bytes_b: u64,
+    observed_page_wss_bytes_a: u64,
+    observed_page_wss_bytes_b: u64,
+    access_pair_count: u64,
+    line_overlap: f64,
+    page_proximity: f64,
+    hugepage_proximity: f64,
+    weighted_overlap: f64,
+    dispersion: f64,
+}
+
+#[derive(Debug, Default)]
+struct DispersionSummaryAccum {
+    pair_count: u64,
+    access_pair_count: u64,
+    line_sum: f64,
+    page_sum: f64,
+    hugepage_sum: f64,
+    weighted_sum: f64,
+    access_weighted_sum: f64,
+}
+
+impl DispersionSummaryAccum {
+    fn observe(&mut self, pair: &DispersionPairRecord) {
+        self.pair_count += 1;
+        self.access_pair_count += pair.access_pair_count;
+        self.line_sum += pair.line_overlap;
+        self.page_sum += pair.page_proximity;
+        self.hugepage_sum += pair.hugepage_proximity;
+        self.weighted_sum += pair.weighted_overlap;
+        self.access_weighted_sum += pair.weighted_overlap * pair.access_pair_count as f64;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        self,
+        window_ms: u64,
+        window_start_ns: u64,
+        window_end_ns: u64,
+        entity_count: usize,
+        sample_count: usize,
+        mean_entity_line_wss_bytes: f64,
+        mean_entity_page_wss_bytes: f64,
+        union_line_wss_bytes: u64,
+        union_page_wss_bytes: u64,
+    ) -> DispersionSummaryRecord {
+        let pair_count = self.pair_count.max(1) as f64;
+        let access_pair_count = self.access_pair_count.max(1) as f64;
+        let mean_weighted_overlap = self.weighted_sum / pair_count;
+        let access_weighted_overlap = self.access_weighted_sum / access_pair_count;
+
+        DispersionSummaryRecord {
+            kind: "summary",
+            window_ms,
+            window_start_ns,
+            window_end_ns,
+            entity_count,
+            pair_count: self.pair_count,
+            sample_count,
+            access_pair_count: self.access_pair_count,
+            mean_entity_line_wss_bytes,
+            mean_entity_page_wss_bytes,
+            union_line_wss_bytes,
+            union_page_wss_bytes,
+            mean_line_overlap: self.line_sum / pair_count,
+            mean_page_proximity: self.page_sum / pair_count,
+            mean_hugepage_proximity: self.hugepage_sum / pair_count,
+            mean_weighted_overlap,
+            mean_dispersion: 1.0 - mean_weighted_overlap,
+            access_weighted_overlap,
+            access_weighted_dispersion: 1.0 - access_weighted_overlap,
+        }
+    }
+}
+
+fn cmd_extract_mem_dispersion(opts: ExtractMemOpts) -> Result<()> {
+    validate_dispersion_opts(&opts)?;
+    let samples = load_dispersion_samples(&opts)?;
+    if samples.is_empty() {
+        bail!("no valid memory samples with physical addresses and timestamps");
+    }
+
+    let trace_start_ns = samples
+        .iter()
+        .map(|sample| sample.time_ns)
+        .min()
+        .context("no memory samples")?;
+
+    for window_ms in &opts.window_ms {
+        emit_dispersion_for_window(&samples, trace_start_ns, *window_ms, &opts)?;
+    }
+
+    Ok(())
+}
+
+fn validate_dispersion_opts(opts: &ExtractMemOpts) -> Result<()> {
+    if opts.window_ms.is_empty() {
+        bail!("at least one --window-ms value is required");
+    }
+    if opts.window_ms.contains(&0) {
+        bail!("--window-ms values must be greater than zero");
+    }
+    if opts.cacheline_bytes == 0 || opts.page_bytes == 0 || opts.hugepage_bytes == 0 {
+        bail!("address granularity sizes must be greater than zero");
+    }
+    if !opts.page_bytes.is_multiple_of(opts.cacheline_bytes)
+        || !opts.hugepage_bytes.is_multiple_of(opts.cacheline_bytes)
+    {
+        bail!("page and hugepage sizes must be multiples of --cacheline-bytes");
+    }
+    if opts.page_decay_bytes <= 0.0 || opts.hugepage_decay_bytes <= 0.0 {
+        bail!("distance decay values must be greater than zero");
+    }
+    if !(0.0..=1.0).contains(&opts.hugepage_weight) {
+        bail!("--hugepage-weight must be between 0 and 1");
+    }
+    Ok(())
+}
+
+fn load_dispersion_samples(opts: &ExtractMemOpts) -> Result<Vec<DispersionSample>> {
+    let file = File::open(&opts.file).context("failed to open mem/perf.mem.jsonl")?;
+    let reader = BufReader::new(file);
+    let comm_regex = opts
+        .comm_regex
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .context("invalid --comm-regex")?;
+    let mut samples = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.context("failed to read line")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: PerfMemRecord =
+            serde_json::from_str(&line).context("failed to parse record")?;
+        if let Some(regex) = &comm_regex
+            && !regex.is_match(&record.comm)
+        {
+            continue;
+        }
+        let Some(time_ns) = record.sample_time_ns() else {
+            continue;
+        };
+        let Some(addr) = dispersion_addr(&record, opts.address_space) else {
+            continue;
+        };
+        if addr == 0 {
+            continue;
+        }
+        samples.push(DispersionSample {
+            entity: dispersion_entity(&record, opts.group_by),
+            time_ns,
+            addr,
+        });
+    }
+
+    Ok(samples)
+}
+
+fn dispersion_addr(record: &PerfMemRecord, address_space: DispersionAddressSpace) -> Option<u64> {
+    match address_space {
+        DispersionAddressSpace::Phys => parse_hex_addr(&record.phys_addr),
+        DispersionAddressSpace::Virt => parse_hex_addr(&record.addr),
+    }
+}
+
+fn parse_hex_addr(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || value == "0" || value == "N/A" {
+        return None;
+    }
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    u64::from_str_radix(value, 16).ok()
+}
+
+fn dispersion_entity(record: &PerfMemRecord, group_by: DispersionGroupBy) -> String {
+    match group_by {
+        DispersionGroupBy::Tid => format!("tid:{}:{}", record.tid, record.comm),
+        DispersionGroupBy::Pid => format!("pid:{}:{}", record.pid, record.comm),
+        DispersionGroupBy::Comm => record.comm.clone(),
+        DispersionGroupBy::CommHint => format!("{}@hint={}", record.comm, record.hint),
+    }
+}
+
+fn emit_dispersion_for_window(
+    samples: &[DispersionSample],
+    trace_start_ns: u64,
+    window_ms: u64,
+    opts: &ExtractMemOpts,
+) -> Result<()> {
+    let window_ns = window_ms
+        .checked_mul(1_000_000)
+        .context("window size overflow")?;
+    let mut windows: BTreeMap<u64, BTreeMap<String, DispersionEntitySamples>> = BTreeMap::new();
+
+    for sample in samples {
+        let offset = sample.time_ns.saturating_sub(trace_start_ns);
+        let window_start_ns = trace_start_ns + (offset / window_ns) * window_ns;
+        windows
+            .entry(window_start_ns)
+            .or_default()
+            .entry(sample.entity.clone())
+            .or_default()
+            .observe(sample.addr, opts);
+    }
+
+    for (window_start_ns, entities) in windows {
+        let window_end_ns = window_start_ns + window_ns;
+        let qualifying: Vec<_> = entities
+            .iter()
+            .filter(|(_, samples)| samples.sample_count() >= opts.min_samples_per_entity)
+            .collect();
+        let sample_count: usize = qualifying
+            .iter()
+            .map(|(_, samples)| samples.sample_count())
+            .sum();
+        let entity_count = qualifying.len();
+        let entity_count_denom = entity_count.max(1) as f64;
+        let mean_entity_line_wss_bytes = qualifying
+            .iter()
+            .map(|(_, samples)| samples.observed_line_wss_bytes(opts) as f64)
+            .sum::<f64>()
+            / entity_count_denom;
+        let mean_entity_page_wss_bytes = qualifying
+            .iter()
+            .map(|(_, samples)| samples.observed_page_wss_bytes(opts) as f64)
+            .sum::<f64>()
+            / entity_count_denom;
+        let union_lines: BTreeSet<_> = qualifying
+            .iter()
+            .flat_map(|(_, samples)| samples.lines.iter().copied())
+            .collect();
+        let union_pages: BTreeSet<_> = qualifying
+            .iter()
+            .flat_map(|(_, samples)| samples.pages.iter().copied())
+            .collect();
+        let union_line_wss_bytes = union_lines.len() as u64 * opts.cacheline_bytes;
+        let union_page_wss_bytes = union_pages.len() as u64 * opts.page_bytes;
+        let mut accum = DispersionSummaryAccum::default();
+        let mut pair_records = Vec::new();
+
+        for i in 0..qualifying.len() {
+            for j in i + 1..qualifying.len() {
+                let (entity_a, samples_a) = qualifying[i];
+                let (entity_b, samples_b) = qualifying[j];
+                let pair = compute_dispersion_pair(
+                    window_ms,
+                    window_start_ns,
+                    window_end_ns,
+                    entity_a,
+                    samples_a,
+                    entity_b,
+                    samples_b,
+                    opts,
+                );
+                accum.observe(&pair);
+                pair_records.push(pair);
+            }
+        }
+
+        let summary = accum.finish(
+            window_ms,
+            window_start_ns,
+            window_end_ns,
+            entity_count,
+            sample_count,
+            mean_entity_line_wss_bytes,
+            mean_entity_page_wss_bytes,
+            union_line_wss_bytes,
+            union_page_wss_bytes,
+        );
+        println!("{}", serde_json::to_string(&summary)?);
+
+        if opts.emit_pairs {
+            for pair in pair_records {
+                println!("{}", serde_json::to_string(&pair)?);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_dispersion_pair(
+    window_ms: u64,
+    window_start_ns: u64,
+    window_end_ns: u64,
+    entity_a: &str,
+    samples_a: &DispersionEntitySamples,
+    entity_b: &str,
+    samples_b: &DispersionEntitySamples,
+    opts: &ExtractMemOpts,
+) -> DispersionPairRecord {
+    let access_pair_count = (samples_a.sample_count() as u64) * (samples_b.sample_count() as u64);
+    let line_overlap = line_jaccard(&samples_a.lines, &samples_b.lines);
+    let page_proximity = symmetric_line_proximity(
+        &samples_a.lines,
+        &samples_b.lines,
+        opts.page_bytes,
+        opts.page_decay_bytes,
+        1.0,
+        opts,
+    );
+    let hugepage_proximity = symmetric_line_proximity(
+        &samples_a.lines,
+        &samples_b.lines,
+        opts.hugepage_bytes,
+        opts.hugepage_decay_bytes,
+        opts.hugepage_weight,
+        opts,
+    );
+    let weighted_overlap = line_overlap.max(page_proximity).max(hugepage_proximity);
+
+    DispersionPairRecord {
+        kind: "pair",
+        window_ms,
+        window_start_ns,
+        window_end_ns,
+        entity_a: entity_a.to_string(),
+        entity_b: entity_b.to_string(),
+        samples_a: samples_a.sample_count(),
+        samples_b: samples_b.sample_count(),
+        observed_line_wss_bytes_a: samples_a.observed_line_wss_bytes(opts),
+        observed_line_wss_bytes_b: samples_b.observed_line_wss_bytes(opts),
+        observed_page_wss_bytes_a: samples_a.observed_page_wss_bytes(opts),
+        observed_page_wss_bytes_b: samples_b.observed_page_wss_bytes(opts),
+        access_pair_count,
+        line_overlap,
+        page_proximity,
+        hugepage_proximity,
+        weighted_overlap,
+        dispersion: 1.0 - weighted_overlap,
+    }
+}
+
+fn line_jaccard(lines_a: &BTreeSet<u64>, lines_b: &BTreeSet<u64>) -> f64 {
+    if lines_a.is_empty() || lines_b.is_empty() {
+        return 0.0;
+    }
+
+    let intersection = lines_a.intersection(lines_b).count();
+    let union = lines_a.len() + lines_b.len() - intersection;
+    intersection as f64 / union as f64
+}
+
+fn symmetric_line_proximity(
+    lines_a: &BTreeSet<u64>,
+    lines_b: &BTreeSet<u64>,
+    granularity_bytes: u64,
+    decay_bytes: f64,
+    weight: f64,
+    opts: &ExtractMemOpts,
+) -> f64 {
+    if lines_a.is_empty() || lines_b.is_empty() {
+        return 0.0;
+    }
+
+    let a_to_b = directional_line_proximity(
+        lines_a,
+        lines_b,
+        granularity_bytes,
+        decay_bytes,
+        weight,
+        opts,
+    );
+    let b_to_a = directional_line_proximity(
+        lines_b,
+        lines_a,
+        granularity_bytes,
+        decay_bytes,
+        weight,
+        opts,
+    );
+    (a_to_b + b_to_a) / 2.0
+}
+
+fn directional_line_proximity(
+    from_lines: &BTreeSet<u64>,
+    to_lines: &BTreeSet<u64>,
+    granularity_bytes: u64,
+    decay_bytes: f64,
+    weight: f64,
+    opts: &ExtractMemOpts,
+) -> f64 {
+    let mut score_sum = 0.0;
+
+    for line in from_lines {
+        let Some(nearest) = nearest_line_in_same_granule(*line, to_lines, granularity_bytes, opts)
+        else {
+            continue;
+        };
+        let distance_bytes = line.abs_diff(nearest) * opts.cacheline_bytes;
+        score_sum += weight * (-(distance_bytes as f64) / decay_bytes).exp();
+    }
+
+    score_sum / from_lines.len() as f64
+}
+
+fn nearest_line_in_same_granule(
+    line: u64,
+    candidates: &BTreeSet<u64>,
+    granularity_bytes: u64,
+    opts: &ExtractMemOpts,
+) -> Option<u64> {
+    let line_addr = line.checked_mul(opts.cacheline_bytes)?;
+    let granule_start_addr = (line_addr / granularity_bytes) * granularity_bytes;
+    let granule_end_addr = granule_start_addr.checked_add(granularity_bytes)?;
+    let start_line = granule_start_addr / opts.cacheline_bytes;
+    let end_line = granule_end_addr / opts.cacheline_bytes;
+
+    let next = candidates.range(line..end_line).next().copied();
+    let prev = candidates.range(start_line..=line).next_back().copied();
+
+    match (prev, next) {
+        (Some(prev), Some(next)) => {
+            if line.abs_diff(prev) <= line.abs_diff(next) {
+                Some(prev)
+            } else {
+                Some(next)
+            }
+        }
+        (Some(prev), None) => Some(prev),
+        (None, Some(next)) => Some(next),
+        (None, None) => None,
+    }
 }
 
 pub fn cmd_extract(opts: ExtractOpts) -> Result<()> {
@@ -612,6 +1202,37 @@ mod tests {
             "hint": hint,
         }))
         .expect("failed to build PerfMemRecord test sample")
+    }
+
+    fn dispersion_opts() -> ExtractMemOpts {
+        ExtractMemOpts {
+            file: PathBuf::from("unused"),
+            mode: ExtractMemMode::Dispersion,
+            workload_cgroup_regex: DEFAULT_WORKLOAD_CGROUP_REGEX.to_string(),
+            workload_allotment_cgroup_regex: DEFAULT_WORKLOAD_ALLOTMENT_CGROUP_REGEX.to_string(),
+            use_hints: false,
+            verbose: 0,
+            window_ms: vec![1],
+            group_by: DispersionGroupBy::Tid,
+            address_space: DispersionAddressSpace::Phys,
+            comm_regex: None,
+            min_samples_per_entity: 1,
+            cacheline_bytes: 64,
+            page_bytes: 4096,
+            hugepage_bytes: 2 * 1024 * 1024,
+            page_decay_bytes: 256.0,
+            hugepage_decay_bytes: 65536.0,
+            hugepage_weight: 0.05,
+            emit_pairs: false,
+        }
+    }
+
+    fn dispersion_entity_samples(addrs: &[u64], opts: &ExtractMemOpts) -> DispersionEntitySamples {
+        let mut samples = DispersionEntitySamples::default();
+        for addr in addrs {
+            samples.observe(*addr, opts);
+        }
+        samples
     }
 
     fn push_samples(
@@ -877,5 +1498,55 @@ mod tests {
                 ("mcrpxy-webNR3".to_string(), 1),
             ]
         );
+    }
+
+    #[test]
+    fn mem_dispersion_scores_exact_line_overlap_and_same_page_proximity() {
+        let opts = dispersion_opts();
+        let samples_a = dispersion_entity_samples(&[0x1000, 0x1040], &opts);
+        let samples_b = dispersion_entity_samples(&[0x1000, 0x1080], &opts);
+
+        let pair =
+            compute_dispersion_pair(1, 0, 1_000_000, "a", &samples_a, "b", &samples_b, &opts);
+
+        assert_eq!(pair.access_pair_count, 4);
+        assert!((pair.line_overlap - (1.0 / 3.0)).abs() < f64::EPSILON);
+        assert!(
+            pair.page_proximity > pair.line_overlap,
+            "same-page proximity should add signal beyond exact line overlap"
+        );
+        assert_eq!(pair.weighted_overlap, pair.page_proximity);
+        assert!(pair.dispersion < 1.0);
+    }
+
+    #[test]
+    fn mem_dispersion_reports_full_dispersion_for_distant_footprints() {
+        let opts = dispersion_opts();
+        let samples_a = dispersion_entity_samples(&[0x1000, 0x1040], &opts);
+        let samples_b = dispersion_entity_samples(&[0x20_0000, 0x20_0040], &opts);
+
+        let pair =
+            compute_dispersion_pair(1, 0, 1_000_000, "a", &samples_a, "b", &samples_b, &opts);
+
+        assert_eq!(pair.line_overlap, 0.0);
+        assert_eq!(pair.page_proximity, 0.0);
+        assert_eq!(pair.hugepage_proximity, 0.0);
+        assert_eq!(pair.weighted_overlap, 0.0);
+        assert_eq!(pair.dispersion, 1.0);
+    }
+
+    #[test]
+    fn mem_dispersion_reports_full_overlap_for_identical_sampled_working_sets() {
+        let opts = dispersion_opts();
+        let samples_a = dispersion_entity_samples(&[0x1000, 0x1040], &opts);
+        let samples_b = dispersion_entity_samples(&[0x1000, 0x1040], &opts);
+
+        let pair =
+            compute_dispersion_pair(1, 0, 1_000_000, "a", &samples_a, "b", &samples_b, &opts);
+
+        assert_eq!(pair.line_overlap, 1.0);
+        assert_eq!(pair.page_proximity, 1.0);
+        assert_eq!(pair.weighted_overlap, 1.0);
+        assert_eq!(pair.dispersion, 0.0);
     }
 }

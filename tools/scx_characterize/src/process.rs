@@ -47,8 +47,8 @@ pub struct PerfMemRecord {
     pub data_page_size: u64,
     #[serde(default)]
     pub hint: u64,
-    #[serde(skip, default)]
-    sample_time_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sample_time_ns: Option<u64>,
 }
 
 /// Represents a single sched trace record from perf sched script
@@ -72,6 +72,13 @@ pub struct PerfSchedScriptRecord {
 impl PerfSchedScriptRecord {
     pub fn sample_time_ns(&self) -> Option<u64> {
         self.sample_time_ns
+    }
+}
+
+impl PerfMemRecord {
+    pub fn sample_time_ns(&self) -> Option<u64> {
+        self.sample_time_ns
+            .or_else(|| parse_perf_time_ns(&self.time))
     }
 }
 
