@@ -261,6 +261,7 @@ impl GroupData {
 struct ClusterResult {
     /// Stable selector clusters that can be emitted in the config.
     clusters: Vec<ConfigCluster>,
+    diagnostics: ConfigClusterDiagnostics,
 }
 
 #[derive(Debug, Clone)]
@@ -313,14 +314,16 @@ struct GroupedCommSamples<'a> {
 #[derive(Debug, Clone)]
 struct ConfigMeasurementNode {
     emit_key: EmitKey,
+    tid: u32,
     sample_count: usize,
     pages: BTreeSet<u64>,
 }
 
 impl ConfigMeasurementNode {
-    fn new(emit_key: EmitKey) -> Self {
+    fn new(emit_key: EmitKey, tid: u32) -> Self {
         Self {
             emit_key,
+            tid,
             sample_count: 0,
             pages: BTreeSet::new(),
         }
@@ -330,6 +333,56 @@ impl ConfigMeasurementNode {
         self.sample_count += 1;
         self.pages.insert(addr / opts.page_bytes);
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConfigClusterDiagnostics {
+    total_samples: usize,
+    threshold_pct: f64,
+    threshold_count: usize,
+    emit_keys: Vec<ConfigEmitKeySummary>,
+    measurement_nodes: Vec<ConfigMeasurementSummary>,
+    overlap_edges: Vec<ConfigOverlapEdge>,
+    stable_selector_components: Vec<StableSelectorComponentSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigEmitKeySummary {
+    emit_key: EmitKey,
+    sample_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigMeasurementSummary {
+    emit_key: EmitKey,
+    tid: u32,
+    sample_count: usize,
+    page_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigOverlapEdge {
+    emit_key_a: EmitKey,
+    tid_a: u32,
+    emit_key_b: EmitKey,
+    tid_b: u32,
+    intersection_pages: usize,
+    union_pages: usize,
+    jaccard: f64,
+    containment: f64,
+}
+
+#[derive(Debug, Clone)]
+struct StableSelectorComponentSummary {
+    emit_key: EmitKey,
+    component_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigClusterBuildResult {
+    clusters: Vec<ConfigCluster>,
+    overlap_edges: Vec<ConfigOverlapEdge>,
+    stable_selector_components: Vec<StableSelectorComponentSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -377,26 +430,59 @@ fn compute_clusters(
     samples: &[&PerfMemRecord],
     opts: &ExtractMemOpts,
 ) -> ClusterResult {
+    let threshold_pct = CONFIG_CLUSTER_SAMPLE_THRESHOLD_PCT;
+    let threshold_count = ((samples.len() as f64) * threshold_pct / 100.0).ceil() as usize;
+    let mut diagnostics = ConfigClusterDiagnostics {
+        total_samples: samples.len(),
+        threshold_pct,
+        threshold_count,
+        ..Default::default()
+    };
+
     // TODO(kkd): Enable clustering for Workload and Rest
     if group_type != GroupType::Allotment {
         return ClusterResult {
             clusters: Vec::new(),
+            diagnostics,
         };
     }
 
-    let emit_groups =
-        significant_emit_groups(samples, CONFIG_CLUSTER_SAMPLE_THRESHOLD_PCT, opts.use_hints);
+    let emit_groups = significant_emit_groups(samples, threshold_pct, opts.use_hints);
+    diagnostics.emit_keys = emit_groups
+        .iter()
+        .map(|(emit_key, samples)| ConfigEmitKeySummary {
+            emit_key: emit_key.clone(),
+            sample_count: samples.len(),
+        })
+        .collect();
+
     if emit_groups.is_empty() {
         return ClusterResult {
             clusters: Vec::new(),
+            diagnostics,
         };
     }
 
     let emit_keys: Vec<_> = emit_groups.keys().cloned().collect();
     let measurement_nodes = build_config_measurement_nodes(samples, &emit_groups, opts);
-    let clusters = cluster_emit_keys_by_overlap(&emit_keys, &measurement_nodes);
+    diagnostics.measurement_nodes = measurement_nodes
+        .iter()
+        .map(|node| ConfigMeasurementSummary {
+            emit_key: node.emit_key.clone(),
+            tid: node.tid,
+            sample_count: node.sample_count,
+            page_count: node.pages.len(),
+        })
+        .collect();
 
-    ClusterResult { clusters }
+    let cluster_result = cluster_emit_keys_by_overlap(&emit_keys, &measurement_nodes);
+    diagnostics.overlap_edges = cluster_result.overlap_edges;
+    diagnostics.stable_selector_components = cluster_result.stable_selector_components;
+
+    ClusterResult {
+        clusters: cluster_result.clusters,
+        diagnostics,
+    }
 }
 
 fn group_samples_by_normalized_comm<'a>(
@@ -486,7 +572,7 @@ fn build_config_measurement_nodes(
 
         nodes
             .entry((emit_key.clone(), sample.tid))
-            .or_insert_with(|| ConfigMeasurementNode::new(emit_key))
+            .or_insert_with(|| ConfigMeasurementNode::new(emit_key, sample.tid))
             .observe(addr, opts);
     }
 
@@ -516,30 +602,47 @@ fn config_emit_key_for_sample(
 fn cluster_emit_keys_by_overlap(
     emit_keys: &[EmitKey],
     measurement_nodes: &[ConfigMeasurementNode],
-) -> Vec<ConfigCluster> {
+) -> ConfigClusterBuildResult {
     let mut key_index = BTreeMap::new();
     for (idx, key) in emit_keys.iter().enumerate() {
         key_index.insert(key.clone(), idx);
     }
 
     let mut measured_dsu = DisjointSet::new(measurement_nodes.len());
+    let mut overlap_edges = Vec::new();
     for i in 0..measurement_nodes.len() {
         for j in i + 1..measurement_nodes.len() {
-            if config_nodes_share_pages(&measurement_nodes[i], &measurement_nodes[j]) {
+            if let Some(edge) = config_overlap_edge(&measurement_nodes[i], &measurement_nodes[j]) {
                 measured_dsu.union(i, j);
+                overlap_edges.push(edge);
             }
         }
     }
 
     let mut key_dsu = DisjointSet::new(emit_keys.len());
     let mut measured_components: BTreeMap<usize, BTreeSet<EmitKey>> = BTreeMap::new();
+    let mut emit_key_components: BTreeMap<EmitKey, BTreeSet<usize>> = BTreeMap::new();
     for (idx, node) in measurement_nodes.iter().enumerate() {
         let root = measured_dsu.find(idx);
         measured_components
             .entry(root)
             .or_default()
             .insert(node.emit_key.clone());
+        emit_key_components
+            .entry(node.emit_key.clone())
+            .or_default()
+            .insert(root);
     }
+
+    let stable_selector_components = emit_key_components
+        .into_iter()
+        .filter_map(|(emit_key, components)| {
+            (components.len() > 1).then_some(StableSelectorComponentSummary {
+                emit_key,
+                component_count: components.len(),
+            })
+        })
+        .collect();
 
     for keys in measured_components.values() {
         let mut iter = keys.iter();
@@ -558,30 +661,49 @@ fn cluster_emit_keys_by_overlap(
         clustered_keys.entry(root).or_default().insert(key.clone());
     }
 
-    clustered_keys
+    let clusters = clustered_keys
         .into_values()
         .map(|keys| ConfigCluster {
             emit_keys: keys.into_iter().collect(),
         })
-        .collect()
+        .collect();
+
+    ConfigClusterBuildResult {
+        clusters,
+        overlap_edges,
+        stable_selector_components,
+    }
 }
 
-fn config_nodes_share_pages(a: &ConfigMeasurementNode, b: &ConfigMeasurementNode) -> bool {
+fn config_overlap_edge(
+    a: &ConfigMeasurementNode,
+    b: &ConfigMeasurementNode,
+) -> Option<ConfigOverlapEdge> {
     if a.pages.is_empty() || b.pages.is_empty() {
-        return false;
+        return None;
     }
 
     let intersection = a.pages.intersection(&b.pages).count();
     if intersection == 0 {
-        return false;
+        return None;
     }
 
     let union = a.pages.len() + b.pages.len() - intersection;
     let jaccard = intersection as f64 / union as f64;
     let containment = intersection as f64 / a.pages.len().min(b.pages.len()) as f64;
 
-    jaccard >= CONFIG_CLUSTER_PAGE_JACCARD_THRESHOLD
-        || containment >= CONFIG_CLUSTER_PAGE_CONTAINMENT_THRESHOLD
+    (jaccard >= CONFIG_CLUSTER_PAGE_JACCARD_THRESHOLD
+        || containment >= CONFIG_CLUSTER_PAGE_CONTAINMENT_THRESHOLD)
+        .then_some(ConfigOverlapEdge {
+            emit_key_a: a.emit_key.clone(),
+            tid_a: a.tid,
+            emit_key_b: b.emit_key.clone(),
+            tid_b: b.tid,
+            intersection_pages: intersection,
+            union_pages: union,
+            jaccard,
+            containment,
+        })
 }
 
 fn summarize_comm_groups(samples: &[&PerfMemRecord]) -> Vec<CommSummary> {
@@ -651,6 +773,95 @@ fn build_emit_key_match_clauses(emit_keys: &[EmitKey]) -> Vec<Vec<CellMatch>> {
             clause
         })
         .collect()
+}
+
+fn print_config_cluster_diagnostics(group_name: &str, result: &ClusterResult, verbosity: u8) {
+    let diagnostics = &result.diagnostics;
+
+    eprintln!(
+        "\n{} overlap clusters: {} emitted clusters from {} significant selectors",
+        group_name,
+        result.clusters.len(),
+        diagnostics.emit_keys.len()
+    );
+    eprintln!(
+        "  significance threshold: {:.1}% (>= {} of {} samples)",
+        diagnostics.threshold_pct, diagnostics.threshold_count, diagnostics.total_samples
+    );
+
+    if diagnostics.emit_keys.is_empty() {
+        eprintln!("  no selectors exceeded the significance threshold");
+        return;
+    }
+
+    eprintln!("  significant selectors:");
+    for summary in &diagnostics.emit_keys {
+        let pct = (summary.sample_count as f64 / diagnostics.total_samples.max(1) as f64) * 100.0;
+        eprintln!(
+            "    {}: {} samples ({:.2}%)",
+            summary.emit_key.display_name(),
+            summary.sample_count,
+            pct
+        );
+    }
+
+    eprintln!("  emitted clusters:");
+    for cluster in &result.clusters {
+        eprintln!(
+            "    {}: {}",
+            config_cluster_name(cluster),
+            emit_key_names(&cluster.emit_keys).join(", ")
+        );
+    }
+
+    if !diagnostics.stable_selector_components.is_empty() {
+        eprintln!("  merged non-emittable measured clusters:");
+        for summary in &diagnostics.stable_selector_components {
+            eprintln!(
+                "    {} appeared in {} measured components; merged for stable config matching",
+                summary.emit_key.display_name(),
+                summary.component_count
+            );
+        }
+    }
+
+    if verbosity < 2 {
+        return;
+    }
+
+    eprintln!("  measured entities:");
+    for node in &diagnostics.measurement_nodes {
+        eprintln!(
+            "    {} tid={}: {} samples, {} pages",
+            node.emit_key.display_name(),
+            node.tid,
+            node.sample_count,
+            node.page_count
+        );
+    }
+
+    eprintln!("  overlap edges:");
+    if diagnostics.overlap_edges.is_empty() {
+        eprintln!("    none");
+    } else {
+        for edge in &diagnostics.overlap_edges {
+            eprintln!(
+                "    {} tid={} <-> {} tid={}: intersection={} pages union={} pages jaccard={:.3} containment={:.3}",
+                edge.emit_key_a.display_name(),
+                edge.tid_a,
+                edge.emit_key_b.display_name(),
+                edge.tid_b,
+                edge.intersection_pages,
+                edge.union_pages,
+                edge.jaccard,
+                edge.containment
+            );
+        }
+    }
+}
+
+fn emit_key_names(emit_keys: &[EmitKey]) -> Vec<String> {
+    emit_keys.iter().map(EmitKey::display_name).collect()
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -761,11 +972,6 @@ fn cmd_extract_mem_config(opts: ExtractMemOpts) -> Result<()> {
 
     if opts.verbose > 0 {
         eprintln!("Total samples: {}", global_total);
-        for name in &group_names {
-            if let Some(data) = groups.get(name) {
-                data.print(name, global_total, opts.verbose, opts.use_hints);
-            }
-        }
     }
 
     let config = generate_config(
@@ -775,6 +981,15 @@ fn cmd_extract_mem_config(opts: ExtractMemOpts) -> Result<()> {
         &opts.workload_allotment_cgroup_regex,
         &opts,
     );
+
+    if opts.verbose > 0 {
+        for name in &group_names {
+            if let Some(data) = groups.get(name) {
+                data.print(name, global_total, opts.verbose, opts.use_hints);
+            }
+        }
+    }
+
     let json = serde_json::to_string_pretty(&config).context("failed to serialize config")?;
     println!("{}", json);
 
@@ -1335,6 +1550,9 @@ fn generate_config(
         }
 
         let clusters = compute_clusters(group_type, &samples, opts);
+        if opts.verbose > 0 && group_type == GroupType::Allotment {
+            print_config_cluster_diagnostics(name, &clusters, opts.verbose);
+        }
         let subcells = build_subcells_from_clusters(&clusters);
 
         let matches = match group_type {
