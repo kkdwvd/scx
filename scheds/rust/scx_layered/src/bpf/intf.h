@@ -13,6 +13,9 @@
 #define __kptr
 #endif
 
+#define MICROQ_KTHREAD_DSQ_BASE (1ULL << 32)
+#define MICROQ_OWNER_DSQ_BASE   (2ULL << 32)
+
 #ifndef __KERNEL__
 typedef unsigned char u8;
 typedef unsigned short u16;
@@ -63,6 +66,9 @@ enum consts {
 	NSEC_PER_MSEC		= (1000ULL * NSEC_PER_USEC),
 	MSEC_PER_SEC		= 1000ULL,
 	NSEC_PER_SEC		= NSEC_PER_MSEC * MSEC_PER_SEC,
+	MICROQ_PERIOD_US	= 100,
+	MICROQ_LAYER_US		= 80,
+	MICROQ_KTHREAD_US	= MICROQ_PERIOD_US - MICROQ_LAYER_US,
 
 	SCXCMD_OP_NONE 		= 0,
 	SCXCMD_OP_JOIN 		= 1,
@@ -121,6 +127,12 @@ enum global_stat_id {
 	GSTAT_SKIP_PREEMPT,
 	GSTAT_FIXUP_VTIME,
 	GSTAT_PREEMPTING_MISMATCH,
+	GSTAT_MICROQ_LAYER_PHASES,
+	GSTAT_MICROQ_KTHREAD_PHASES,
+	GSTAT_MICROQ_LAYER_DISPATCHES,
+	GSTAT_MICROQ_KTHREAD_DISPATCHES,
+	GSTAT_MICROQ_WORK_CONSERVING,
+	GSTAT_MICROQ_TIMER_ERRORS,
 	NR_GSTATS,
 };
 
@@ -401,6 +413,7 @@ struct layer {
 	bool			prev_over_idle_core;
 	bool			idle_confined;
 	bool			fully_allocated;
+	bool			microq;
 	int			growth_algo;
 
 	u64			nr_tasks;
