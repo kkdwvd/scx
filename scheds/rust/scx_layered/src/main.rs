@@ -2155,6 +2155,7 @@ impl<'a> Scheduler<'a> {
                     xllc_mig_min_us,
                     placement,
                     member_expire_ms,
+                    microq,
                     ..
                 } = spec.kind.common();
 
@@ -2179,6 +2180,7 @@ impl<'a> Scheduler<'a> {
                 layer.growth_algo = growth_algo.as_bpf_enum();
                 layer.weight = *weight;
                 layer.member_expire_ms = *member_expire_ms;
+                layer.microq.write(*microq);
                 layer.disallow_open_after_ns = match disallow_open_after_us.unwrap() {
                     v if v == u64::MAX => v,
                     v => v * 1000,
@@ -4651,7 +4653,43 @@ fn verify_layer_specs(specs: &[LayerSpec]) -> Result<HashMap<u64, HintLayerInfo>
         bail!("Too many layer specs");
     }
 
+    let mut microq_layer_name: Option<&str> = None;
+
     for (idx, spec) in specs.iter().enumerate() {
+        if spec.kind.common().microq {
+            if let Some(existing) = microq_layer_name {
+                bail!(
+					"MicroQ may be enabled on only one layer (already enabled on {:?}, also found {:?})",
+					existing,
+					spec.name
+				);
+            }
+
+            match &spec.kind {
+                LayerKind::Open { .. } => {
+                    bail!("MicroQ layer {:?} must not be Open", spec.name);
+                }
+                LayerKind::Confined {
+                    cpus_range,
+                    cpus_range_frac,
+                    ..
+                }
+                | LayerKind::Grouped {
+                    cpus_range,
+                    cpus_range_frac,
+                    ..
+                } => match (cpus_range, cpus_range_frac) {
+                    (Some((min, max)), None) if min == max => {}
+                    _ => bail!(
+                        "MicroQ layer {:?} requires a fixed cpus_range [N, N]",
+                        spec.name
+                    ),
+                },
+            }
+
+            microq_layer_name = Some(spec.name.as_str());
+        }
+
         if idx < nr_specs - 1 {
             if spec.matches.is_empty() {
                 bail!("Non-terminal spec {:?} has NULL matches", spec.name);

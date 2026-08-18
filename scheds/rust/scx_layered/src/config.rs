@@ -153,6 +153,11 @@ pub struct LayerCommon {
     pub placement: LayerPlacement,
     #[serde(default)]
     pub member_expire_ms: u64,
+    /// Enable the experimental per-CPU MicroQ policy for CPUs owned by this
+    /// layer. The policy currently uses a fixed 100us period: 80us for the
+    /// owner layer and 20us for foreign per-CPU kthreads.
+    #[serde(default)]
+    pub microq: bool,
     #[serde(default = "default_xnuma_threshold")]
     pub xnuma_threshold: (f64, f64),
     #[serde(default = "default_xnuma_threshold_delta")]

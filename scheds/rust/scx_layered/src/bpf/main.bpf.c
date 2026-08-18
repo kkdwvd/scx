@@ -26,6 +26,10 @@
 
 char _license[] SEC("license") = "GPL";
 
+#ifndef BPF_F_TIMER_HARDIRQ
+#define BPF_F_TIMER_HARDIRQ (1ULL << 4)
+#endif
+
 extern unsigned CONFIG_HZ __kconfig;
 
 static u32 do_refresh_layer_cpumasks = 0;
@@ -332,6 +336,213 @@ static void gstat_add(u32 id, struct cpu_ctx *cpuc, s64 delta)
 static void gstat_inc(u32 id, struct cpu_ctx *cpuc)
 {
 	gstat_add(id, cpuc, 1);
+}
+
+enum microq_phase {
+	MICROQ_PHASE_LAYER,
+	MICROQ_PHASE_KTHREAD,
+};
+
+struct microq_timer_wrapper {
+	struct bpf_timer	timer;
+	u32			cpu;
+	u32			phase;
+	u64			epoch_ns;
+	u64			next_deadline_ns;
+	bool			initialized;
+	bool			active;
+	bool			callback_set;
+	bool			used;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_CPUS);
+	__type(key, u32);
+	__type(value, struct microq_timer_wrapper);
+} microq_timer_data SEC(".maps");
+
+static __always_inline u64 microq_kthread_dsq_id(u32 cpu)
+{
+	return MICROQ_KTHREAD_DSQ_BASE | cpu;
+}
+
+static __always_inline u64 microq_owner_dsq_id(u32 cpu)
+{
+	return MICROQ_OWNER_DSQ_BASE | cpu;
+}
+
+static __always_inline struct layer *microq_owner_layer(struct cpu_ctx *cpuc)
+{
+	u32 layer_id;
+
+	if (!cpuc)
+		return NULL;
+
+	layer_id = cpuc->layer_id;
+	if (layer_id >= nr_layers || layer_id >= MAX_LAYERS)
+		return NULL;
+	if (!layers[layer_id].microq)
+		return NULL;
+
+	return &layers[layer_id];
+}
+
+static __always_inline struct microq_timer_wrapper *lookup_microq_timer(u32 cpu)
+{
+	if (cpu >= nr_possible_cpus || cpu >= MAX_CPUS)
+		return NULL;
+
+	return bpf_map_lookup_elem(&microq_timer_data, &cpu);
+}
+
+static int microq_timer_cb(void *map, int *key,
+			   struct microq_timer_wrapper *timerw)
+{
+	struct cpu_ctx *cpuc;
+	u64 cycle_ns, epoch_ns, layer_ns, next_deadline_ns, now, period_ns;
+	u32 cpu;
+	int err;
+
+	cpu = bpf_get_smp_processor_id();
+	cpuc = lookup_cpu_ctx(-1);
+	if (!cpuc) {
+		WRITE_ONCE(timerw->active, false);
+		return 0;
+	}
+	if (timerw->cpu != cpu) {
+		gstat_inc(GSTAT_MICROQ_TIMER_ERRORS, cpuc);
+		WRITE_ONCE(timerw->active, false);
+		return 0;
+	}
+	if (!microq_owner_layer(cpuc)) {
+		WRITE_ONCE(timerw->active, false);
+		return 0;
+	}
+
+	period_ns = MICROQ_PERIOD_US * NSEC_PER_USEC;
+	layer_ns = MICROQ_LAYER_US * NSEC_PER_USEC;
+	now = bpf_ktime_get_ns();
+	epoch_ns = READ_ONCE(timerw->epoch_ns);
+	if (now < epoch_ns) {
+		gstat_inc(GSTAT_MICROQ_TIMER_ERRORS, cpuc);
+		WRITE_ONCE(timerw->active, false);
+		return 0;
+	}
+
+	/* Catch up from the original epoch without stretching either phase. */
+	cycle_ns = (now - epoch_ns) % period_ns;
+	if (cycle_ns < layer_ns) {
+		WRITE_ONCE(timerw->phase, MICROQ_PHASE_LAYER);
+		next_deadline_ns = now - cycle_ns + layer_ns;
+		gstat_inc(GSTAT_MICROQ_LAYER_PHASES, cpuc);
+	} else {
+		WRITE_ONCE(timerw->phase, MICROQ_PHASE_KTHREAD);
+		next_deadline_ns = now - cycle_ns + period_ns;
+		gstat_inc(GSTAT_MICROQ_KTHREAD_PHASES, cpuc);
+	}
+	WRITE_ONCE(timerw->next_deadline_ns, next_deadline_ns);
+
+	/*
+	 * Use an absolute deadline tied to the original epoch so dispatch latency
+	 * cannot lengthen the next phase. Every rearm remains pinned to this CPU.
+	 */
+	err = bpf_timer_start(&timerw->timer, next_deadline_ns,
+			      BPF_F_TIMER_ABS | BPF_F_TIMER_CPU_PIN);
+	if (err) {
+		gstat_inc(GSTAT_MICROQ_TIMER_ERRORS, cpuc);
+		WRITE_ONCE(timerw->active, false);
+		return 0;
+	}
+
+	scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+	return 0;
+}
+
+static __always_inline bool ensure_microq_timer(struct cpu_ctx *cpuc)
+{
+	struct microq_timer_wrapper *timerw;
+	u64 next_deadline_ns, now;
+	u32 cpu;
+	int err;
+
+	if (!microq_owner_layer(cpuc))
+		return false;
+
+	cpu = cpuc->cpu;
+	if (!(timerw = lookup_microq_timer(cpu))) {
+		gstat_inc(GSTAT_MICROQ_TIMER_ERRORS, cpuc);
+		return false;
+	}
+
+	WRITE_ONCE(timerw->used, true);
+	if (READ_ONCE(timerw->active))
+		return true;
+
+	if (!READ_ONCE(timerw->initialized)) {
+		err = bpf_timer_init(&timerw->timer, &microq_timer_data,
+				     CLOCK_MONOTONIC | BPF_F_TIMER_HARDIRQ);
+		if (err)
+			goto err;
+
+		timerw->cpu = cpu;
+		WRITE_ONCE(timerw->initialized, true);
+	}
+
+	if (!READ_ONCE(timerw->callback_set)) {
+		err = bpf_timer_set_callback(&timerw->timer, microq_timer_cb);
+		if (err)
+			goto err;
+		WRITE_ONCE(timerw->callback_set, true);
+	}
+
+	/* A newly activated CPU always starts with the owner-layer phase. */
+	now = bpf_ktime_get_ns();
+	next_deadline_ns = now + MICROQ_LAYER_US * NSEC_PER_USEC;
+	WRITE_ONCE(timerw->phase, MICROQ_PHASE_LAYER);
+	WRITE_ONCE(timerw->epoch_ns, now);
+	WRITE_ONCE(timerw->next_deadline_ns, next_deadline_ns);
+	WRITE_ONCE(timerw->active, true);
+	err = bpf_timer_start(&timerw->timer, next_deadline_ns,
+			      BPF_F_TIMER_ABS | BPF_F_TIMER_CPU_PIN);
+	if (err)
+		goto err_active;
+
+	return true;
+
+err_active:
+	WRITE_ONCE(timerw->active, false);
+err:
+	gstat_inc(GSTAT_MICROQ_TIMER_ERRORS, cpuc);
+	return false;
+}
+
+static __always_inline u32 microq_cpu_phase(struct cpu_ctx *cpuc)
+{
+	struct microq_timer_wrapper *timerw;
+
+	if (!(timerw = lookup_microq_timer(cpuc->cpu)))
+		return MICROQ_PHASE_LAYER;
+	return READ_ONCE(timerw->phase);
+}
+
+static __always_inline bool microq_drain_stale_cpu(struct cpu_ctx *cpuc)
+{
+	struct microq_timer_wrapper *timerw;
+
+	if (microq_owner_layer(cpuc))
+		return false;
+	if (!(timerw = lookup_microq_timer(cpuc->cpu)) ||
+	    !READ_ONCE(timerw->used))
+		return false;
+
+	/* CPU ownership can move while CPU-specific MicroQ DSQs still hold work. */
+	if (scx_bpf_dsq_move_to_local(microq_owner_dsq_id(cpuc->cpu), 0))
+		return true;
+	if (scx_bpf_dsq_move_to_local(microq_kthread_dsq_id(cpuc->cpu), 0))
+		return true;
+
+	return false;
 }
 
 static void lstat_add(u32 id, struct layer *layer, struct cpu_ctx *cpuc, s64 delta)
@@ -1285,7 +1496,7 @@ bool should_try_preempt_first(s32 cand, struct layer *layer,
 	struct cpu_ctx *cand_cpuc, *sib_cpuc;
 	s32 sib;
 
-	if (!layer->preempt || !layer->preempt_first)
+	if (layer->microq || !layer->preempt || !layer->preempt_first)
 		return false;
 
 	if (layer->kind == LAYER_KIND_CONFINED &&
@@ -1695,6 +1906,13 @@ s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 		cpu = pick_idle_cpu(p, prev_cpu, cpuc, taskc, layer, true);
 
 	if (cpu >= 0) {
+		struct cpu_ctx *target_cpuc = lookup_cpu_ctx(cpu);
+		struct layer *target_owner = microq_owner_layer(target_cpuc);
+
+		/* All MicroQ work must reach enqueue() and its phase-gated DSQs. */
+		if (target_owner && (target_owner == layer || is_percpu_kthread(p)))
+			return cpu;
+
 		lstat_inc(LSTAT_SEL_LOCAL, layer, cpuc);
 		taskc->dsq_id = SCX_DSQ_LOCAL;
 		scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, 0);
@@ -1886,11 +2104,11 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	struct cpu_ctx *cpuc, *task_cpuc;
 	struct task_ctx *taskc;
 	struct llc_ctx *llcc;
-	struct layer *layer;
+	struct layer *layer, *cpu_owner;
 	bool wakeup = enq_flags & SCX_ENQ_WAKEUP;
 	s32 cpu, task_cpu = scx_bpf_task_cpu(p);
 	u32 llc_id, layer_id;
-	bool yielding, try_preempt_first;
+	bool microq_owner_task, yielding, try_preempt_first;
 	u64 queued_runtime;
 	u64 *lstats;
 
@@ -1906,6 +2124,10 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	layer_id = taskc->layer_id;
 	if (!(layer = lookup_layer(layer_id)))
 		return;
+	if (!(task_cpuc = lookup_cpu_ctx(task_cpu)))
+		return;
+	cpu_owner = microq_owner_layer(task_cpuc);
+	microq_owner_task = cpu_owner && cpu_owner->id == layer_id;
 
 	if (enq_flags & SCX_ENQ_REENQ) {
 		lstat_inc(LSTAT_ENQ_REENQ, layer, cpuc);
@@ -1926,6 +2148,36 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	cpuc->try_preempt_first = false;
 
 	/*
+	 * Route all CPU-bound MicroQ work before any direct-dispatch path.
+	 * Owner tasks (including NAPI kthreads) and foreign per-CPU kthreads
+	 * use separate CPU-specific DSQs so ops.dispatch() can gate both sides.
+	 */
+	if (cpu_owner &&
+	    ((microq_owner_task && p->nr_cpus_allowed == 1) ||
+	     (!microq_owner_task && is_percpu_kthread(p)))) {
+		struct microq_timer_wrapper *timerw;
+		bool preferred;
+		task_uncharge_qrt(taskc);
+		if ((timerw = lookup_microq_timer(task_cpu)))
+			WRITE_ONCE(timerw->used, true);
+
+		if (microq_owner_task) {
+			taskc->dsq_id = microq_owner_dsq_id(task_cpu);
+			preferred = microq_cpu_phase(task_cpuc) == MICROQ_PHASE_LAYER;
+		} else {
+			taskc->dsq_id = microq_kthread_dsq_id(task_cpu);
+			preferred = microq_cpu_phase(task_cpuc) == MICROQ_PHASE_KTHREAD;
+		}
+
+		scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, enq_flags);
+		if (preferred)
+			scx_bpf_kick_cpu(task_cpu, SCX_KICK_PREEMPT);
+		else
+			scx_bpf_kick_cpu(task_cpu, SCX_KICK_IDLE);
+		return;
+	}
+
+	/*
 	 * Does @p prefer to preempt its previous CPU even when there are other
 	 * idle CPUs? If @p was already on the CPU (!wakeup), layered_dispatch()
 	 * already decided that @p shouldn't continue running on it. Don't
@@ -1943,11 +2195,16 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 		if (cpu < 0)
 			goto skip_ddsp;
 
+		struct cpu_ctx *target_cpuc = lookup_cpu_ctx(cpu);
+
+		/* Owner-layer tasks must remain on a controllable layer DSQ. */
+		if (target_cpuc && microq_owner_layer(target_cpuc) == layer)
+			goto skip_ddsp;
+
 		/* Non-confined layers can run anywhere. */
 		if (layer->kind != LAYER_KIND_CONFINED)
 			goto do_ddsp;
 
-		struct cpu_ctx *target_cpuc = lookup_cpu_ctx(cpu);
 		if (!target_cpuc)
 			goto skip_ddsp;
 
@@ -1964,13 +2221,11 @@ do_ddsp:
 
 skip_ddsp:
 
-	if (!(task_cpuc = lookup_cpu_ctx(task_cpu)))
-		return;
 
 	/*
 	 * No idle CPU, try preempting.
 	 */
-	if (layer->preempt && !yielding) {
+	if (layer->preempt && !layer->microq && !yielding) {
 		/*
 		 * See try_preempt_first block above for explanation on the
 		 * wakeup test.
@@ -2041,7 +2296,8 @@ preempt_xnuma_done: ;
 	 * of layered userspace code and give boost to per-cpu kthreads as they
 	 * are usually important for system performance and responsiveness.
 	 */
-	if (((p->flags & PF_KTHREAD) && p->nr_cpus_allowed < nr_possible_cpus) ||
+	if (((p->flags & PF_KTHREAD) && p->nr_cpus_allowed < nr_possible_cpus &&
+	     !microq_owner_task) ||
 	    is_scheduler_task(p)) {
 		struct cpumask *layer_cpumask;
 
@@ -2131,9 +2387,9 @@ preempt_xnuma_done: ;
 	 *   With per-node allocation, the layer will always have CPUs on
 	 *   those nodes.
 	 */
-	if ((!taskc->all_cpus_allowed &&
+	if (((!taskc->all_cpus_allowed &&
 	     !taskc->all_cpuset_cpus_allowed &&
-	     !taskc->cpus_node_aligned) ||
+	     !taskc->cpus_node_aligned) && !microq_owner_task) ||
 	    !layer->nr_cpus) {
 		// Special handle for thread that has affinity set, but need more CPU time.
 		// XXX: If we need to support more than one thread (which is probably bad from
@@ -2191,6 +2447,9 @@ preempt_xnuma_done: ;
 	else
 		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns, vtime, enq_flags);
 	lstat_inc(LSTAT_ENQ_DSQ, layer, cpuc);
+
+	if (microq_owner_task && microq_cpu_phase(task_cpuc) == MICROQ_PHASE_LAYER)
+		scx_bpf_kick_cpu(task_cpu, SCX_KICK_PREEMPT);
 
 	/*
 	 * Interlocked with refresh_cpumasks(). scx_bpf_dsq_insert[_vtime]()
@@ -2681,6 +2940,88 @@ bool try_consume_layers(u32 *layer_order, u32 nr, u32 exclude_layer_id,
 	return false;
 }
 
+static __always_inline bool
+microq_dispatch(struct task_struct *prev, struct task_ctx *prev_taskc,
+		struct layer *prev_layer, struct cpu_ctx *cpuc,
+		struct llc_ctx *llcc)
+{
+	struct layer *owner = microq_owner_layer(cpuc);
+	bool prev_kthread = false, prev_owner = false;
+	u32 phase;
+
+	if (!owner)
+		return false;
+	if (!ensure_microq_timer(cpuc))
+		return false;
+
+	if (prev && prev_taskc && prev_layer &&
+	    !is_task_layer_hint_stale(prev, prev_taskc)) {
+		prev_owner = prev_taskc->layer_id == owner->id;
+		prev_kthread = is_percpu_kthread(prev) && !prev_owner;
+	}
+
+	phase = microq_cpu_phase(cpuc);
+	if (phase == MICROQ_PHASE_LAYER) {
+		if (prev_owner) {
+			scx_bpf_task_set_slice(prev, prev_layer->slice_ns);
+			gstat_inc(GSTAT_MICROQ_LAYER_DISPATCHES, cpuc);
+			return true;
+		}
+		if (scx_bpf_dsq_move_to_local(microq_owner_dsq_id(cpuc->cpu), 0)) {
+			gstat_inc(GSTAT_MICROQ_LAYER_DISPATCHES, cpuc);
+			return true;
+		}
+		if (try_consume_layer(owner->id, cpuc, llcc, false)) {
+			gstat_inc(GSTAT_MICROQ_LAYER_DISPATCHES, cpuc);
+			return true;
+		}
+
+		/* The owner side is empty, so the kthread side may borrow. */
+		if (prev_kthread) {
+			scx_bpf_task_set_slice(prev, prev_layer->slice_ns);
+			gstat_inc(GSTAT_MICROQ_KTHREAD_DISPATCHES, cpuc);
+			gstat_inc(GSTAT_MICROQ_WORK_CONSERVING, cpuc);
+			return true;
+		}
+		if (scx_bpf_dsq_move_to_local(microq_kthread_dsq_id(cpuc->cpu), 0)) {
+			gstat_inc(GSTAT_MICROQ_KTHREAD_DISPATCHES, cpuc);
+			gstat_inc(GSTAT_MICROQ_WORK_CONSERVING, cpuc);
+			return true;
+		}
+	} else {
+		if (prev_kthread) {
+			scx_bpf_task_set_slice(prev, prev_layer->slice_ns);
+			gstat_inc(GSTAT_MICROQ_KTHREAD_DISPATCHES, cpuc);
+			return true;
+		}
+		if (scx_bpf_dsq_move_to_local(microq_kthread_dsq_id(cpuc->cpu), 0)) {
+			gstat_inc(GSTAT_MICROQ_KTHREAD_DISPATCHES, cpuc);
+			return true;
+		}
+
+		/* The kthread side is empty, so the owner side may borrow. */
+		if (prev_owner) {
+			scx_bpf_task_set_slice(prev, prev_layer->slice_ns);
+			gstat_inc(GSTAT_MICROQ_LAYER_DISPATCHES, cpuc);
+			gstat_inc(GSTAT_MICROQ_WORK_CONSERVING, cpuc);
+			return true;
+		}
+		if (scx_bpf_dsq_move_to_local(microq_owner_dsq_id(cpuc->cpu), 0)) {
+			gstat_inc(GSTAT_MICROQ_LAYER_DISPATCHES, cpuc);
+			gstat_inc(GSTAT_MICROQ_WORK_CONSERVING, cpuc);
+			return true;
+		}
+		if (try_consume_layer(owner->id, cpuc, llcc, false)) {
+			gstat_inc(GSTAT_MICROQ_LAYER_DISPATCHES, cpuc);
+			gstat_inc(GSTAT_MICROQ_WORK_CONSERVING, cpuc);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
 bool __always_inline sib_keep_idle(s32 cpu, struct task_struct *prev __arg_trusted, struct layer *prev_layer,
 				   struct task_ctx *prev_taskc, struct cpu_ctx *cpuc)
 {
@@ -2718,8 +3059,6 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 	if (!(cpuc = lookup_cpu_ctx(-1)))
 		return;
 
-	if (antistall_consume(cpuc))
-		return;
 
 	/* !NULL prev_taskc indicates runnable prev */
 	if (prev && (prev->scx.flags & SCX_TASK_QUEUED)) {
@@ -2727,6 +3066,17 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 		    !(prev_layer = lookup_layer(prev_taskc->layer_id)))
 			return;
 	}
+
+	if (microq_drain_stale_cpu(cpuc))
+		return;
+	if (!(llcc = lookup_llc_ctx(cpuc->llc_id)))
+		return;
+	if (microq_dispatch(prev, prev_taskc, prev_layer, cpuc, llcc))
+		return;
+
+	if (antistall_consume(cpuc))
+		return;
+
 
 	if (prev && sib_keep_idle(cpu, prev, prev_layer, prev_taskc, cpuc))
 		return;
@@ -2754,8 +3104,6 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 	}
 
-	if (!(llcc = lookup_llc_ctx(cpuc->llc_id)))
-		return;
 
 	/* always consume hi_fb_dsq_id first for kthreads */
 	if (scx_bpf_dsq_move_to_local(cpuc->hi_fb_dsq_id, 0))
@@ -4701,6 +5049,25 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 		if (ret)
 			return ret;
 	}
+
+	bpf_for(i, 0, nr_possible_cpus) {
+		struct cpu_ctx *cpuc;
+
+		if (!(cpuc = lookup_cpu_ctx(i)))
+			return -ENOENT;
+
+		ret = scx_bpf_create_dsq(microq_owner_dsq_id(i), cpuc->node_id);
+		if (ret < 0)
+			return ret;
+
+		ret = scx_bpf_create_dsq(microq_kthread_dsq_id(i), cpuc->node_id);
+		if (ret < 0)
+			return ret;
+
+		dbg("CFG creating MicroQ DSQs 0x%llx/0x%llx on CPU %d",
+		    microq_owner_dsq_id(i), microq_kthread_dsq_id(i), i);
+	}
+
 
 	dbg("CFG: Dumping configuration, nr_online_cpus=%d smt_enabled=%d little_cores=%d",
 	    nr_online_cpus, smt_enabled, has_little_cores);
