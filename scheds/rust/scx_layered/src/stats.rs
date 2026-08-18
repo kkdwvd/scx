@@ -44,6 +44,18 @@ const GSTAT_SKIP_PREEMPT: usize = bpf_intf::global_stat_id_GSTAT_SKIP_PREEMPT as
 const GSTAT_FIXUP_VTIME: usize = bpf_intf::global_stat_id_GSTAT_FIXUP_VTIME as usize;
 const GSTAT_PREEMPTING_MISMATCH: usize =
     bpf_intf::global_stat_id_GSTAT_PREEMPTING_MISMATCH as usize;
+const GSTAT_MICROQ_LAYER_PHASES: usize =
+    bpf_intf::global_stat_id_GSTAT_MICROQ_LAYER_PHASES as usize;
+const GSTAT_MICROQ_KTHREAD_PHASES: usize =
+    bpf_intf::global_stat_id_GSTAT_MICROQ_KTHREAD_PHASES as usize;
+const GSTAT_MICROQ_LAYER_DISPATCHES: usize =
+    bpf_intf::global_stat_id_GSTAT_MICROQ_LAYER_DISPATCHES as usize;
+const GSTAT_MICROQ_KTHREAD_DISPATCHES: usize =
+    bpf_intf::global_stat_id_GSTAT_MICROQ_KTHREAD_DISPATCHES as usize;
+const GSTAT_MICROQ_WORK_CONSERVING: usize =
+    bpf_intf::global_stat_id_GSTAT_MICROQ_WORK_CONSERVING as usize;
+const GSTAT_MICROQ_TIMER_ERRORS: usize =
+    bpf_intf::global_stat_id_GSTAT_MICROQ_TIMER_ERRORS as usize;
 
 const LSTAT_SEL_LOCAL: usize = bpf_intf::layer_stat_id_LSTAT_SEL_LOCAL as usize;
 const LSTAT_ENQ_LOCAL: usize = bpf_intf::layer_stat_id_LSTAT_ENQ_LOCAL as usize;
@@ -652,6 +664,19 @@ pub struct SysStats {
     pub fixup_vtime: u64,
     #[stat(desc = "Number of times cpuc->preempting_task didn't come on the CPU")]
     pub preempting_mismatch: u64,
+    #[stat(desc = "MicroQ transitions into the owner-layer phase")]
+    pub microq_layer_phases: u64,
+    #[stat(desc = "MicroQ transitions into the per-CPU kthread phase")]
+    pub microq_kthread_phases: u64,
+    #[stat(desc = "MicroQ owner-layer dispatch decisions")]
+    pub microq_layer_dispatches: u64,
+    #[stat(desc = "MicroQ per-CPU kthread dispatch decisions")]
+    pub microq_kthread_dispatches: u64,
+    #[stat(desc = "MicroQ dispatches borrowed by the non-preferred phase")]
+    pub microq_work_conserving: u64,
+    #[stat(desc = "MicroQ timer setup, pinning, or rearm errors")]
+    pub microq_timer_errors: u64,
+
     #[stat(desc = "per-node fallback CPUs")]
     pub fallback_cpus: BTreeMap<u32, u32>,
     #[stat(desc = "per-layer statistics")]
@@ -720,6 +745,13 @@ impl SysStats {
             skip_preempt: stats.bpf_stats.gstats[GSTAT_SKIP_PREEMPT],
             fixup_vtime: stats.bpf_stats.gstats[GSTAT_FIXUP_VTIME],
             preempting_mismatch: stats.bpf_stats.gstats[GSTAT_PREEMPTING_MISMATCH],
+            microq_layer_phases: stats.bpf_stats.gstats[GSTAT_MICROQ_LAYER_PHASES],
+            microq_kthread_phases: stats.bpf_stats.gstats[GSTAT_MICROQ_KTHREAD_PHASES],
+            microq_layer_dispatches: stats.bpf_stats.gstats[GSTAT_MICROQ_LAYER_DISPATCHES],
+            microq_kthread_dispatches: stats.bpf_stats.gstats[GSTAT_MICROQ_KTHREAD_DISPATCHES],
+            microq_work_conserving: stats.bpf_stats.gstats[GSTAT_MICROQ_WORK_CONSERVING],
+            microq_timer_errors: stats.bpf_stats.gstats[GSTAT_MICROQ_TIMER_ERRORS],
+
             fallback_cpus: fallback_cpus
                 .iter()
                 .map(|(&k, &v)| (k as u32, v as u32))
@@ -783,6 +815,17 @@ impl SysStats {
             "skip_preempt={} antistall={} fixup_vtime={} preempting_mismatch={}",
             self.skip_preempt, self.antistall, self.fixup_vtime, self.preempting_mismatch
         )?;
+
+        writeln!(
+			w,
+			"microq_layer_phases={} microq_kthread_phases={} microq_layer_dispatches={} microq_kthread_dispatches={} microq_work_conserving={} microq_timer_errors={}",
+			self.microq_layer_phases,
+			self.microq_kthread_phases,
+			self.microq_layer_dispatches,
+			self.microq_kthread_dispatches,
+			self.microq_work_conserving,
+			self.microq_timer_errors,
+		)?;
 
         writeln!(
             w,
