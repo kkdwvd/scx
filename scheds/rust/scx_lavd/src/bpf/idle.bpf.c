@@ -212,7 +212,8 @@ s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur)
 			break;
 
 		cpu = cpu_order[i];
-		if (bpf_cpumask_test_cpu(cpu, cast_mask(online_src_mask)))
+		if (bpf_cpumask_test_cpu(cpu, cast_mask(online_src_mask)) &&
+		    !cpu_is_netstack(cpu))
 			return cpu;
 	};
 	return -ENOENT;
@@ -273,8 +274,10 @@ static s32 find_cpu_for_ovrflw_extend(struct pick_ctx *ctx)
 		/* Cheaper cpumask bit test first; LLC lookup is multi-load. */
 		if (!bpf_cpumask_test_cpu(cpu, cast_mask(online_src_mask)))
 			continue;
-		/* Skip CPUs already in overflow. */
+		/* Skip CPUs already in overflow, and the network partition. */
 		if (bpf_cpumask_test_cpu(cpu, cast_mask(ovrflw)))
+			continue;
+		if (cpu_is_netstack(cpu))
 			continue;
 		if (topo_cpu_to_llc_id(cpu) != prev_llc)
 			continue;
@@ -410,6 +413,15 @@ bool can_run_on_cpu(struct pick_ctx *ctx, s32 cpu)
 {
 	struct bpf_cpumask *a_mask;
 	struct bpf_cpumask *o_mask;
+
+	/*
+	 * The network partition is closed to every other task, however wide
+	 * its affinity: this is where a task's previous CPU and its waker's
+	 * CPU are tested, and the partition's threads are the wakers of the
+	 * application they serve.
+	 */
+	if (cpu_is_netstack(cpu))
+		return false;
 
 	if (!test_task_flag(ctx->taskc, LAVD_FLAG_IS_AFFINITIZED))
 		return true;

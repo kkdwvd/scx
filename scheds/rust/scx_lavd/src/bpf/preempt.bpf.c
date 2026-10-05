@@ -370,6 +370,15 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 	 * its time slice.
 	 */
 	now = scx_bpf_now();
+
+	/*
+	 * An ordinary task does not preempt its way into the network
+	 * partition.
+	 */
+	if (netstack_enabled && preferred_cpu >= 0 &&
+	    cpu_is_netstack(preferred_cpu))
+		preferred_cpu = -ENOENT;
+
 	if (!no_slice_boost &&
 	    (preferred_cpu >= 0) &&
 	    (cpuc_victim = get_cpu_ctx_id(preferred_cpu)) &&
@@ -420,6 +429,12 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 		return;
 
 	bpf_cpumask_and(cpumask, cast_mask(cd_cpumask), p->cpus_ptr);
+	if (netstack_enabled) {
+		struct bpf_cpumask *free = netstack_free_cpumask;
+
+		if (free)
+			bpf_cpumask_and(cpumask, cast_mask(cpumask), cast_mask(free));
+	}
 
 	/*
 	 * Find a victim CPU among CPUs that run lower-priority tasks.

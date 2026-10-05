@@ -674,6 +674,12 @@ static void update_stat_for_refill(struct task_struct *p,
 static bool can_direct_dispatch(struct cpu_ctx *cpuc, bool is_cpu_idle)
 {
 	/*
+	 * Nothing is dispatched straight onto a partition CPU.
+	 */
+	if (cpuc_is_netstack(cpuc))
+		return false;
+
+	/*
 	 * An idle CPU with nothing queued cannot be congested --
 	 * queued_on_cpu() covers every DSQ that is_cpu_congested()
 	 * counts -- so no congestion check is needed on this path.
@@ -1414,6 +1420,44 @@ bool scan_dsq_for_ovflw_ext(u64 dsq_id, s32 cpu,
 	return false;
 }
 
+/*
+ * Move @prev, runnable on a CPU that now belongs to the network partition,
+ * to its domain queue and wake an active CPU for it. A pinned or
+ * migration-disabled task stays: it can run nowhere else, and the per-CPU
+ * DSQ serves it.
+ */
+static bool netstack_evict(struct task_struct *prev, struct cpu_ctx *cpuc)
+{
+	task_ctx *taskc = get_task_ctx(prev);
+	struct bpf_cpumask *active, *tmp;
+	u64 dsq_id;
+	s32 cpu;
+
+	if (!taskc || is_effectively_pinned(taskc) ||
+	    is_migration_disabled(prev))
+		return false;
+
+	dsq_id = get_target_dsq_id(prev, cpuc, taskc);
+	if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
+		return false;
+	scx_bpf_task_set_dsq_vtime(prev, calc_when_to_run(prev, taskc));
+	scx_bpf_dsq_insert_vtime(prev, dsq_id, sys_stat.slice_wall,
+				 prev->scx.dsq_vtime, 0);
+	account_queued_load(taskc, cpuc->cpdom_id);
+
+	bpf_rcu_read_lock();
+	active = active_cpumask;
+	tmp = cpuc->temp_mask;
+	if (active && tmp) {
+		bpf_cpumask_and(tmp, cast_mask(active), prev->cpus_ptr);
+		cpu = scx_bpf_pick_idle_cpu(cast_mask(tmp), 0);
+		if (cpu >= 0)
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+	}
+	bpf_rcu_read_unlock();
+	return true;
+}
+
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct bpf_cpumask *active, *ovrflw;
@@ -1450,9 +1494,15 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	/*
 	 * A CPU of the network partition serves the pinned tasks that can
 	 * run nowhere else, never the shared queues; this comes before the
-	 * shortcut below, which does not look at the masks.
+	 * shortcut below, which does not look at the masks. A task that was
+	 * running here when the CPU joined cannot just be left: a dispatch
+	 * that moves nothing keeps prev. It is handed to its domain queue
+	 * instead, which ops.dispatch() may do for prev.
 	 */
 	if (cpuc_is_netstack(cpuc)) {
+		if (prev && (prev->scx.flags & SCX_TASK_QUEUED) &&
+		    netstack_evict(prev, cpuc))
+			prev = NULL;
 		netstack_dispatch(cpu, prev, cpuc);
 		return;
 	}
