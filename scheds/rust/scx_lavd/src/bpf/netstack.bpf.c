@@ -271,13 +271,25 @@ int netstack_resize(u32 pool, u32 target, u32 flags)
 		resize_nr++;
 	}
 
-	/* Pass 2: add free candidates in preference order, whole cores under SMT. */
+	/*
+	 * Pass 2: add free candidates from the least preferred end of lavd's
+	 * CPU order, whole cores under SMT. The order's head is what core
+	 * compaction fills first and the application's hot cores; its tail is
+	 * what compaction idles first, so the partition grows into the cores
+	 * the application would give up anyway and its working set moves
+	 * least. The order's unfilled tail positions read as CPU 0, so a zero
+	 * past the first position is skipped.
+	 */
 	bpf_for(i, 0, nr_cpu_ids) {
-		if (resize_nr >= want || i >= LAVD_CPU_ID_MAX)
+		int pos = nr_cpu_ids - 1 - i;
+
+		if (resize_nr >= want || pos < 0 || pos >= LAVD_CPU_ID_MAX)
 			break;
-		cpu = cpu_order[i];
+		cpu = cpu_order[pos];
 		if (cpu >= LAVD_CPU_ID_MAX)
 			break;
+		if (!cpu && pos)
+			continue;
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc)
 			break;
