@@ -80,7 +80,7 @@ struct sys_stat {
 	u64	nr_lc_on_big;	/* latency-critical tasks scheduled on big core */
 
 	u32	nr_netstack_cpus; /* CPUs granted to the network soft partition */
-	u32	__pad0;
+	u32	nr_netstack_borrow; /* of which open to borrowing by other tasks */
 };
 
 /*

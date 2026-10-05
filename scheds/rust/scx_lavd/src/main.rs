@@ -307,6 +307,31 @@ struct Opts {
     #[clap(long = "netstack-slice-us", default_value = "20000")]
     netstack_slice_us: u64,
 
+    /// Let other tasks borrow a partition CPU's idle time: once its
+    /// registered threads' share of the CPU has stayed at or below
+    /// --netstack-borrow-below-pct for --netstack-borrow-after-ms, the CPU
+    /// takes tasks from its domain's queues until the share rises to
+    /// --netstack-borrow-above-pct; a registered thread queued on it
+    /// preempts a borrower at once. A pool that requested exclusivity is
+    /// never borrowed from. Not available with --per-cpu-dsq.
+    #[clap(long = "netstack-borrow", action = clap::ArgAction::SetTrue)]
+    netstack_borrow: bool,
+
+    /// Registered threads' share of a partition CPU, in percent, at or below
+    /// which the CPU counts as under-used by them.
+    #[clap(long = "netstack-borrow-below-pct", default_value = "50")]
+    netstack_borrow_below_pct: u8,
+
+    /// Registered threads' share of a partition CPU, in percent, at or above
+    /// which borrowing stops.
+    #[clap(long = "netstack-borrow-above-pct", default_value = "80")]
+    netstack_borrow_above_pct: u8,
+
+    /// How long, in milliseconds, a partition CPU has to stay under-used
+    /// before other tasks may borrow it.
+    #[clap(long = "netstack-borrow-after-ms", default_value = "500")]
+    netstack_borrow_after_ms: u32,
+
     /// Directory in bpffs under which the netstack programs and record are
     /// pinned for the stack: register_thread, unregister_thread,
     /// get_capacity, request_capacity and shm.
@@ -454,6 +479,13 @@ impl Opts {
         }
 
         if self.netstack {
+            if self.netstack_borrow
+                && (self.netstack_borrow_below_pct > self.netstack_borrow_above_pct
+                    || self.netstack_borrow_above_pct > 100)
+            {
+                info!("--netstack-borrow needs below <= above <= 100.");
+                return None;
+            }
             if self.netstack_min_cpus > 0
                 && self.netstack_max_cpus > 0
                 && self.netstack_min_cpus > self.netstack_max_cpus
@@ -901,6 +933,11 @@ impl<'a> Scheduler<'a> {
         };
         rodata.netstack_min_cpus = opts.netstack_min_cpus;
         rodata.netstack_slice_ns = opts.netstack_slice_us * 1000;
+        rodata.netstack_borrow = opts.netstack_borrow;
+        rodata.netstack_borrow_below = ((opts.netstack_borrow_below_pct as u32) << 10) / 100;
+        rodata.netstack_borrow_above = ((opts.netstack_borrow_above_pct as u32) << 10) / 100;
+        rodata.netstack_borrow_after =
+            std::cmp::max(1, opts.netstack_borrow_after_ms / 10);
         // Replenishment wakes dispatch through the built-in idle tracking.
         rodata.bw_kick_builtin_idle = true;
 
@@ -1097,6 +1134,7 @@ impl<'a> Scheduler<'a> {
                 let nr_queued_task = st.nr_queued_task;
                 let nr_active = st.nr_active;
                 let nr_net = st.nr_netstack_cpus;
+                let nr_borrow = st.nr_netstack_borrow;
                 let nr_sched = st.nr_sched;
                 let nr_preempt = st.nr_preempt;
                 let pc_pc = Self::get_pc(st.nr_perf_cri, nr_sched);
@@ -1120,6 +1158,7 @@ impl<'a> Scheduler<'a> {
                     nr_queued_task,
                     nr_active,
                     nr_net,
+                    nr_borrow,
                     nr_sched,
                     nr_preempt,
                     pc_pc,

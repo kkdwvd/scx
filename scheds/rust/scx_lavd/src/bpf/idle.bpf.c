@@ -720,6 +720,7 @@ s32 netstack_pick_cpu(struct pick_ctx *ctx, bool *is_idle)
 {
 	struct bpf_cpumask *net = netstack_task_cpumask(ctx->taskc);
 	struct bpf_cpumask *tmp = ctx->cpuc_cur->temp_mask;
+	struct bpf_cpumask *avail;
 	s32 cpu;
 
 	if (!net || !tmp || bpf_cpumask_empty(cast_mask(net)))
@@ -739,6 +740,24 @@ s32 netstack_pick_cpu(struct pick_ctx *ctx, bool *is_idle)
 	if (cpu >= 0) {
 		*is_idle = true;
 		return cpu;
+	}
+
+	/*
+	 * No idle partition CPU: one running a borrower or a pinned task is
+	 * as good, since the registered thread preempts it, and better than
+	 * queueing behind another registered thread.
+	 */
+	avail = netstack_avail_cpumask;
+	if (avail) {
+		bpf_cpumask_and(tmp, cast_mask(tmp), cast_mask(avail));
+		if (!bpf_cpumask_empty(cast_mask(tmp))) {
+			if (bpf_cpumask_test_cpu(ctx->prev_cpu, cast_mask(tmp)))
+				return ctx->prev_cpu;
+			cpu = bpf_cpumask_any_distribute(cast_mask(tmp));
+			if (cpu < nr_cpu_ids)
+				return cpu;
+		}
+		bpf_cpumask_and(tmp, cast_mask(net), ctx->p->cpus_ptr);
 	}
 
 	if (bpf_cpumask_test_cpu(ctx->prev_cpu, cast_mask(tmp)))

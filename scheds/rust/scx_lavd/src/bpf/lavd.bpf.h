@@ -66,6 +66,7 @@ enum consts_netstack {
 	NETSTACK_CPU_GRANTED		= 0x1, /* in the partition */
 	NETSTACK_CPU_FRESH		= 0x2, /* granted since its last dispatch */
 	NETSTACK_CPU_NEXT		= 0x4, /* scratch of the grant being computed */
+	NETSTACK_CPU_BORROW		= 0x8, /* open to borrowing by other tasks */
 };
 
 /*
@@ -374,6 +375,9 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 /* The network soft partition (netstack.bpf.c). */
 extern const volatile bool	netstack_enabled;
 extern const volatile u64	netstack_slice_ns;
+extern const volatile bool	netstack_borrow;
+extern struct bpf_cpumask __kptr *netstack_borrow_cpumask; /* partition CPUs open to borrowing */
+extern struct bpf_cpumask __kptr *netstack_avail_cpumask; /* partition CPUs not running a registered thread */
 extern struct bpf_cpumask __kptr *netstack_cpumask;	/* the granted CPUs of every pool */
 extern struct bpf_cpumask __kptr *netstack_free_cpumask; /* online CPUs outside the partition */
 extern struct bpf_cpumask __kptr *netstack_cand_cpumask;
@@ -384,6 +388,7 @@ int netstack_tick(void);
 int netstack_register_task(struct task_struct *p, u32 pool, bool on);
 void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc);
 void netstack_kick(s32 cpu, struct cpu_ctx *cpuc, bool is_idle);
+void netstack_borrow_kick(struct task_struct *p, struct cpu_ctx *cpuc_cur);
 
 /*
  * CPU context
@@ -448,6 +453,11 @@ struct cpu_ctx {
 	 */
 	volatile u64	tot_dom_pinned_task_time_wall;
 	volatile u64	tot_dom_pinned_task_time_invr;
+	/*
+	 * Wall-clock time spent running registered network threads, for the
+	 * borrowing gate of a partition CPU.
+	 */
+	volatile u64	tot_netstack_task_time_wall;
 	volatile u64	sum_perf_cri;	/* sum of performance criticality */
 	volatile u32	min_perf_cri;	/* minimum performance criticality */
 	volatile u32	max_perf_cri;	/* maximum performance criticality */
@@ -515,6 +525,11 @@ struct cpu_ctx {
 	u32		avg_dom_pinned_util_wall;
 	u32		cur_dom_pinned_util_invr;
 	u32		avg_dom_pinned_util_invr;
+	/*
+	 * Registered network threads' share of the last interval, in
+	 * LAVD_SHIFT fixed-point: what the borrowing gate reads.
+	 */
+	u32		cur_netstack_util_wall;
 
 	/* --- cacheline 3 boundary (192 bytes): sys_stat raw inputs --- */
 	/*
@@ -544,7 +559,8 @@ struct cpu_ctx {
 	volatile u32	max_freq_observed; /* maximum CPU frequency observed within an interval scaled to 1024 */
 	volatile u32	max_freq;	/* maximum CPU frequency averaged across multiple intervals */
 	u8		netstack_pool;	/* the network pool holding this CPU, or 0 */
-	u8		__pad2[3];
+	u8		netstack_idle_ticks; /* consecutive intervals under the borrowing threshold */
+	u8		__pad2[2];
 	/*
 	 * Snapshot of scx_clock_task() taken at the end of the last
 	 * collect_sys_stat() interval. scx_clock_task() advances during tasks

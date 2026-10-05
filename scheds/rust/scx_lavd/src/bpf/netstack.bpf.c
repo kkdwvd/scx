@@ -53,6 +53,16 @@ const volatile bool	netstack_enabled;
 const volatile u32	netstack_max_cpus;	/* the host's cap on the partition, all pools */
 const volatile u32	netstack_min_cpus;	/* per pool, once it has asked for any */
 const volatile u64	netstack_slice_ns;	/* a registered thread's slice on a partition CPU */
+/*
+ * Borrowing: other tasks may run on a partition CPU's idle time, once its
+ * registered threads' share has stayed below netstack_borrow_below for
+ * netstack_borrow_after intervals, until it rises to netstack_borrow_above;
+ * a pool that asked to be exclusive is never borrowed from.
+ */
+const volatile bool	netstack_borrow;
+const volatile u32	netstack_borrow_below;	/* LAVD_SHIFT fixed-point */
+const volatile u32	netstack_borrow_above;
+const volatile u32	netstack_borrow_after;	/* intervals */
 
 /*
  * The granted CPUs of every pool, their union, the online CPUs outside the
@@ -62,6 +72,13 @@ private(LAVD) struct bpf_cpumask netstack_pool_cpumask[NETSTACK_MAX_POOLS];
 private(LAVD) struct bpf_cpumask __kptr *netstack_cpumask;
 private(LAVD) struct bpf_cpumask __kptr *netstack_free_cpumask;
 private(LAVD) struct bpf_cpumask __kptr *netstack_cand_cpumask;
+private(LAVD) struct bpf_cpumask __kptr *netstack_borrow_cpumask;
+/*
+ * Partition CPUs not running a registered thread: idle, or running a
+ * borrower or a pinned task, which a registered thread placed there
+ * preempts. Kept by ops.running() and ops.stopping() on partition CPUs.
+ */
+private(LAVD) struct bpf_cpumask __kptr *netstack_avail_cpumask;
 
 /*
  * The shared records, one per pool. Mmapable so that a user space stack
@@ -175,7 +192,7 @@ void netstack_task_exit(task_ctx *taskc)
 __weak
 int netstack_resize(u32 pool, u32 target, u32 flags)
 {
-	struct bpf_cpumask *net, *free, *cand, *active, *ovrflw, *pmask;
+	struct bpf_cpumask *net, *free, *cand, *active, *ovrflw, *pmask, *avail;
 	const volatile u16 *cpu_order = get_cpu_order();
 	const struct cpumask *online;
 	struct netstack_shm *s = netstack_rec(pool);
@@ -201,7 +218,8 @@ int netstack_resize(u32 pool, u32 target, u32 flags)
 	cand = netstack_cand_cpumask;
 	active = active_cpumask;
 	ovrflw = ovrflw_cpumask;
-	if (!net || !free || !cand || !active || !ovrflw || !pmask) {
+	avail = netstack_avail_cpumask;
+	if (!net || !free || !cand || !active || !ovrflw || !pmask || !avail) {
 		bpf_rcu_read_unlock();
 		return -ENOMEM;
 	}
@@ -365,6 +383,7 @@ int netstack_resize(u32 pool, u32 target, u32 flags)
 			cpuc->netstack = NETSTACK_CPU_GRANTED | NETSTACK_CPU_FRESH;
 			bpf_cpumask_set_cpu(cpu, pmask);
 			bpf_cpumask_set_cpu(cpu, net);
+			bpf_cpumask_set_cpu(cpu, avail);
 			bpf_cpumask_clear_cpu(cpu, free);
 			bpf_cpumask_clear_cpu(cpu, active);
 			bpf_cpumask_clear_cpu(cpu, ovrflw);
@@ -375,8 +394,10 @@ int netstack_resize(u32 pool, u32 target, u32 flags)
 			if (!was)
 				continue;
 			cpuc->netstack = 0;
+			cpuc->netstack_idle_ticks = 0;
 			bpf_cpumask_clear_cpu(cpu, pmask);
 			bpf_cpumask_clear_cpu(cpu, net);
+			bpf_cpumask_clear_cpu(cpu, avail);
 			if (cpuc->is_online) {
 				bpf_cpumask_set_cpu(cpu, free);
 				bpf_cpumask_set_cpu(cpu, active);
@@ -432,10 +453,78 @@ static __always_inline void netstack_apply(u32 pool, bool hotplug)
 }
 
 /*
- * The tick: answer the pools' new requests, and reconcile every grant with
- * a CPU that went offline. Runs before core compaction in
- * update_sys_stat(), so the compaction pass that follows sees the new
- * per-CPU marks.
+ * The borrowing gate, per partition CPU and interval. Other tasks may use
+ * a partition CPU only once its registered threads have left most of it
+ * idle for a while: a sustained shortfall of use, not a momentary gap, and
+ * never on a pool that asked to be exclusive. The gate shuts as soon as the
+ * registered share rises again; the kick that queues a registered thread
+ * preempts a borrower at once in any case, and a borrower whose CPU shut
+ * the gate is evicted at its next dispatch. A CPU with the gate open and
+ * nothing of its own to run is woken when its domain queue has work.
+ */
+static __always_inline void netstack_borrow_gate(void)
+{
+	struct bpf_cpumask *borrow = netstack_borrow_cpumask;
+	struct netstack_shm *s;
+	struct cpu_ctx *cpuc;
+	u32 cpu, nr = 0;
+	bool open, exclusive;
+
+	if (!borrow)
+		return;
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (cpu >= LAVD_CPU_ID_MAX)
+			break;
+		cpuc = get_cpu_ctx_id(cpu);
+		if (!cpuc)
+			break;
+		if (!(cpuc->netstack & NETSTACK_CPU_GRANTED)) {
+			if (cpuc->netstack & NETSTACK_CPU_BORROW) {
+				cpuc->netstack &= ~NETSTACK_CPU_BORROW;
+				bpf_cpumask_clear_cpu(cpu, borrow);
+			}
+			continue;
+		}
+		s = netstack_rec(cpuc->netstack_pool);
+		exclusive = !s || (READ_ONCE(s->flags) & NETSTACK_REQ_EXCLUSIVE);
+		open = cpuc->netstack & NETSTACK_CPU_BORROW;
+		if (!netstack_borrow || exclusive || !use_cpdom_dsq()) {
+			open = false;
+			cpuc->netstack_idle_ticks = 0;
+		} else if (open) {
+			if (cpuc->cur_netstack_util_wall >= netstack_borrow_above) {
+				open = false;
+				cpuc->netstack_idle_ticks = 0;
+			}
+		} else if (cpuc->cur_netstack_util_wall <= netstack_borrow_below) {
+			if (cpuc->netstack_idle_ticks < 255)
+				cpuc->netstack_idle_ticks++;
+			open = cpuc->netstack_idle_ticks >= netstack_borrow_after;
+		} else {
+			cpuc->netstack_idle_ticks = 0;
+		}
+		if (open) {
+			cpuc->netstack |= NETSTACK_CPU_BORROW;
+			bpf_cpumask_set_cpu(cpu, borrow);
+			nr++;
+			/* Idle with work waiting in its domain: wake it to borrow. */
+			if ((scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpuc->cpdom_id)) ||
+			     scx_bpf_dsq_nr_queued(cpdom_to_turb_dsq(cpuc->cpdom_id))) &&
+			    scx_bpf_test_and_clear_cpu_idle(cpu))
+				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		} else {
+			cpuc->netstack &= ~NETSTACK_CPU_BORROW;
+			bpf_cpumask_clear_cpu(cpu, borrow);
+		}
+	}
+	sys_stat.nr_netstack_borrow = nr;
+}
+
+/*
+ * The tick: answer the pools' new requests, reconcile every grant with a
+ * CPU that went offline, and run the borrowing gate. Runs before core
+ * compaction in update_sys_stat(), so the compaction pass that follows
+ * sees the new per-CPU marks.
  */
 __weak
 int netstack_tick(void)
@@ -452,7 +541,30 @@ int netstack_tick(void)
 			break;
 		netstack_apply(pool, hotplug);
 	}
+	bpf_rcu_read_lock();
+	netstack_borrow_gate();
+	bpf_rcu_read_unlock();
 	return 0;
+}
+
+/*
+ * A task found no idle CPU of its own: wake an idle partition CPU of its
+ * domain that is open to borrowing, if there is one, so that it pulls the
+ * task from the domain queue.
+ */
+__hidden
+void netstack_borrow_kick(struct task_struct *p, struct cpu_ctx *cpuc_cur)
+{
+	struct bpf_cpumask *borrow = netstack_borrow_cpumask;
+	struct bpf_cpumask *tmp = cpuc_cur->temp_mask;
+	s32 cpu;
+
+	if (!borrow || !tmp || bpf_cpumask_empty(cast_mask(borrow)))
+		return;
+	bpf_cpumask_and(tmp, cast_mask(borrow), p->cpus_ptr);
+	cpu = scx_bpf_pick_idle_cpu(cast_mask(tmp), 0);
+	if (cpu >= 0)
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
 /*
@@ -514,6 +626,18 @@ void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc)
 
 	if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu), 0))
 		return;
+
+	/*
+	 * Nothing of the partition's: with the borrowing gate open, take a
+	 * task from the domain's queues; the kick that queues a registered
+	 * thread preempts it again.
+	 */
+	if (cpuc->netstack & NETSTACK_CPU_BORROW) {
+		if (scx_bpf_dsq_move_to_local(cpdom_to_dsq(cpuc->cpdom_id), 0))
+			return;
+		if (scx_bpf_dsq_move_to_local(cpdom_to_turb_dsq(cpuc->cpdom_id), 0))
+			return;
+	}
 
 	consume_prev(prev, NULL, cpuc);
 }
@@ -695,7 +819,8 @@ int lavd_netstack_request_capacity(struct netstack_req_arg *arg)
 	if (!netstack_enabled)
 		return -ENODEV;
 	if (arg->pool >= nr_pools() || !(s = netstack_rec(arg->pool)) ||
-	    (arg->flags & ~(NETSTACK_REQ_CANDIDATES | NETSTACK_REQ_DROP)))
+	    (arg->flags & ~(NETSTACK_REQ_CANDIDATES | NETSTACK_REQ_DROP |
+			    NETSTACK_REQ_EXCLUSIVE)))
 		return -EINVAL;	/* the other flags are reserved */
 	if (arg->target_cpus < -1)
 		return -EINVAL;	/* a target beyond the cap is granted the cap */

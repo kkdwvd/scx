@@ -27,7 +27,7 @@
 enum {
 	NETSTACK_REQ_CANDIDATES	= 0x1,	/* grant only within the candidates mask */
 	NETSTACK_REQ_DROP	= 0x2,	/* release the CPUs of the drop mask first */
-	NETSTACK_REQ_EXCLUSIVE	= 0x4,	/* reserved: no borrowing of idle time */
+	NETSTACK_REQ_EXCLUSIVE	= 0x4,	/* no borrowing of the pool's idle time by other tasks */
 	NETSTACK_REQ_NO_QUANTA	= 0x8,	/* reserved: no time share with pinned tasks */
 };
 

@@ -614,6 +614,10 @@ static void account_task_runtime(struct task_struct *p,
 			   cpuc->tot_dom_pinned_task_time_invr + task_time_invr);
 	}
 
+	if (taskc->netstack)
+		WRITE_ONCE(cpuc->tot_netstack_task_time_wall,
+			   cpuc->tot_netstack_task_time_wall + task_time_wall);
+
 	taskc->acc_runtime_wall += task_time_wall;
 	taskc->acc_runtime_invr += task_time_invr;
 	taskc->svc_time_iwgt += task_time_iwgt;
@@ -1184,6 +1188,13 @@ kick_cpu_out:
 	}
 
 	/*
+	 * No idle CPU of its own: a partition CPU open to borrowing may take
+	 * the task from the domain queue.
+	 */
+	if (netstack_borrow)
+		netstack_borrow_kick(p, cpuc_cur);
+
+	/*
 	 * If there is no idle CPU, try to preempt a task. Find and kick a
 	 * victim CPU, which runs a less urgent task.
 	 */
@@ -1577,7 +1588,9 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	 * for prev.
 	 */
 	if (cpuc_is_netstack(cpuc)) {
+		/* A borrower keeps the CPU while it is open to borrowing. */
 		if (prev && (prev->scx.flags & SCX_TASK_QUEUED) &&
+		    !(cpuc->netstack & NETSTACK_CPU_BORROW) &&
 		    netstack_evict(prev, cpuc))
 			prev = NULL;
 		netstack_dispatch(cpu, prev, cpuc);
@@ -1857,6 +1870,23 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	unaccount_queued_load(taskc);
 	unaccount_queued_load_pcpu(taskc);
 	cpuc->netstack_curr = taskc->netstack;
+	if (cpuc_is_netstack(cpuc)) {
+		/*
+		 * A partition CPU running anything but a registered thread is
+		 * available to one: it preempts whatever runs there.
+		 */
+		struct bpf_cpumask *avail;
+
+		bpf_rcu_read_lock();
+		avail = netstack_avail_cpumask;
+		if (avail) {
+			if (taskc->netstack)
+				bpf_cpumask_clear_cpu(cpuc->cpu_id, avail);
+			else
+				bpf_cpumask_set_cpu(cpuc->cpu_id, avail);
+		}
+		bpf_rcu_read_unlock();
+	}
 
 	/*
 	 * If the sched_ext core directly dispatched a task, calculating the
@@ -1969,6 +1999,17 @@ void BPF_STRUCT_OPS(lavd_stopping, struct task_struct *p, bool runnable)
 	}
 
 	update_stat_for_stopping(p, taskc, cpuc);
+
+	if (taskc->netstack && cpuc_is_netstack(cpuc)) {
+		struct bpf_cpumask *avail;
+
+		cpuc->netstack_curr = 0;
+		bpf_rcu_read_lock();
+		avail = netstack_avail_cpumask;
+		if (avail)
+			bpf_cpumask_set_cpu(cpuc->cpu_id, avail);
+		bpf_rcu_read_unlock();
+	}
 }
 
 void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
@@ -2595,6 +2636,14 @@ static int init_cpumasks(void)
 		goto out;
 
 	err = calloc_cpumask(&netstack_cand_cpumask);
+	if (err)
+		goto out;
+
+	err = calloc_cpumask(&netstack_borrow_cpumask);
+	if (err)
+		goto out;
+
+	err = calloc_cpumask(&netstack_avail_cpumask);
 	if (err)
 		goto out;
 out:

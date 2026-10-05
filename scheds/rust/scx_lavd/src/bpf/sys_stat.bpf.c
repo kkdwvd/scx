@@ -299,6 +299,14 @@ static void collect_sys_stat(void)
 		compute_wall = time_delta(c->duration_wall, cpuc->idle_total_wall);
 		cpuc->steal_time_wall = time_delta(compute_wall, cpuc->tot_task_time_wall);
 		cpuc->tot_task_time_wall = 0;
+		/*
+		 * The registered network threads' share of the interval, for
+		 * the borrowing gate; clamped like the other shares.
+		 */
+		cpuc->cur_netstack_util_wall =
+			(min(cpuc->tot_netstack_task_time_wall, compute_wall) << LAVD_SHIFT) /
+			c->duration_wall;
+		cpuc->tot_netstack_task_time_wall = 0;
 		dom_pinned_task_time_wall = cpuc->tot_dom_pinned_task_time_wall;
 		cpuc->tot_dom_pinned_task_time_wall = 0;
 		now_task = scx_clock_task(cpu);
