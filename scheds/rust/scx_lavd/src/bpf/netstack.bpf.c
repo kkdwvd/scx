@@ -733,8 +733,14 @@ static __always_inline int netstack_read_grant(struct netstack_shm *s, u32 *nr,
 					       u64 *applied, u64 *mask)
 {
 	u64 s1, s2;
-	int i, words = (nr_cpu_ids + 63) / 64, tries = 0;
+	int i, words = (nr_cpu_ids + 63) / 64;
 
+	/*
+	 * The tick holds the grant's seqlock for the length of a resize, a
+	 * few passes over the CPUs, so a reader may spin for that long. The
+	 * loop is bounded by may_goto alone: a retry counter in a register
+	 * is unrolled by the verifier up to its bound.
+	 */
 	do {
 		s1 = __sync_fetch_and_add(&s->grant_seq, 0);
 		if (s1 & 1)
@@ -753,7 +759,7 @@ static __always_inline int netstack_read_grant(struct netstack_shm *s, u32 *nr,
 			*seq = s1;
 			return 0;
 		}
-	} while (++tries < 64 && can_loop);
+	} while (can_loop);
 	return -EAGAIN;
 }
 
@@ -851,10 +857,14 @@ int lavd_netstack_request_capacity(struct netstack_req_arg *arg)
 	__sync_fetch_and_add(&s->req_seq, 1);
 	arg->req_seq = seq + 2;
 
-	/* The grant in force now: the one the next tick replaces. */
+	/*
+	 * The grant in force now: the one the next tick replaces. The request
+	 * stands whether or not the grant could be read through a concurrent
+	 * tick; the caller polls get_capacity for the one that answers it.
+	 */
 	err = netstack_read_grant(s, &arg->nr_granted, &target, &cap, &seq, &seq,
 				  arg->granted);
 	if (err)
-		return err;
+		arg->nr_granted = READ_ONCE(s->nr_granted);
 	return arg->nr_granted;
 }
