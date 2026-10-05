@@ -231,7 +231,7 @@ struct task_ctx {
 	volatile u32	cpdom_id;		/* chosen compute domain id at ops.enqueue() */
 	volatile u32	suggested_cpu_id;	/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
 	volatile s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
-	u8	netstack;		/* a registered network thread; written by netstack.bpf.c only */
+	u8	netstack;		/* a registered network thread: its pool + 1; written by netstack.bpf.c only */
 	u8	netstack_cnt;		/* counted in cpu_ctx.nr_foreign_pinned at pinned_cpu_id */
 	u16	__pad0;
 	u64	last_running_clk;	/* last time when scheduled in */
@@ -374,13 +374,14 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 /* The network soft partition (netstack.bpf.c). */
 extern const volatile bool	netstack_enabled;
 extern const volatile u64	netstack_slice_ns;
-extern struct bpf_cpumask __kptr *netstack_cpumask;	/* the granted CPUs */
+extern struct bpf_cpumask __kptr *netstack_cpumask;	/* the granted CPUs of every pool */
 extern struct bpf_cpumask __kptr *netstack_free_cpumask; /* online CPUs outside the partition */
 extern struct bpf_cpumask __kptr *netstack_cand_cpumask;
+extern struct bpf_cpumask	netstack_pool_cpumask[NETSTACK_MAX_POOLS]; /* each pool's granted CPUs */
 
 int netstack_init(void);
 int netstack_tick(void);
-int netstack_register_task(struct task_struct *p, bool on);
+int netstack_register_task(struct task_struct *p, u32 pool, bool on);
 void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc);
 void netstack_kick(s32 cpu, struct cpu_ctx *cpuc, bool is_idle);
 
@@ -542,7 +543,8 @@ struct cpu_ctx {
 	u32		avg_perf_factor;
 	volatile u32	max_freq_observed; /* maximum CPU frequency observed within an interval scaled to 1024 */
 	volatile u32	max_freq;	/* maximum CPU frequency averaged across multiple intervals */
-	u32		__pad2;
+	u8		netstack_pool;	/* the network pool holding this CPU, or 0 */
+	u8		__pad2[3];
 	/*
 	 * Snapshot of scx_clock_task() taken at the end of the last
 	 * collect_sys_stat() interval. scx_clock_task() advances during tasks
@@ -871,6 +873,19 @@ static __always_inline bool cpuc_is_netstack(struct cpu_ctx *cpuc)
 }
 
 void netstack_task_exit(task_ctx *taskc);
+
+/*
+ * The mask a registered thread runs on: its pool's CPUs, or every granted
+ * CPU for a thread of the global pool.
+ */
+static __always_inline struct bpf_cpumask *netstack_task_cpumask(task_ctx *taskc)
+{
+	u32 pool = taskc->netstack;
+
+	if (pool <= 1 || pool > NETSTACK_MAX_POOLS)
+		return netstack_cpumask;
+	return MEMBER_VPTR(netstack_pool_cpumask, [pool - 1]);
+}
 
 /* Overflow-set bookkeeping helpers. */
 

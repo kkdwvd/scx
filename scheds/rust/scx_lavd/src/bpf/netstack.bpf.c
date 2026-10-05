@@ -9,17 +9,27 @@
  * registered threads onto them with priority, and takes the CPUs back when
  * the stack lowers its target.
  *
- * The request and the grant share one record, netstack_shm. The stack
- * writes the request; lavd's sys_stat tick reads it and answers. The tick
- * is the only writer of the partition and of the active and overflow masks,
- * so a request cannot race the mask rebuilds of core compaction, and a grant
- * takes effect within one tick (LAVD_SYS_STAT_INTERVAL_NS).
+ * The partition is a set of pools. Pool 0 is global: its candidates are
+ * every CPU. Pool 1 + d is the pool of compute domain d (an LLC, or one
+ * core type of an LLC), for a stack that keeps a queue's work on the LLC
+ * its interrupt lands on: its candidates are the domain's CPUs. Each pool
+ * has its own request and grant, in its own entry of netstack_shm; the
+ * host's cap bounds their sum, and every pool leaves at least one CPU of
+ * its domain to the rest. A registered thread names its pool and runs on
+ * that pool's CPUs; a thread of the global pool runs on any granted CPU.
  *
- * A granted CPU is marked in its cpu_ctx (NETSTACK_CPU_GRANTED) and in
- * netstack_cpumask; netstack_free_cpumask holds the online CPUs outside the
- * partition for the paths that need the complement. Registered threads are
- * marked in their task_ctx and dispatched from a per-CPU net DSQ; foreign
- * pinned tasks keep running from the per-CPU DSQ.
+ * The stack writes a pool's request; lavd's sys_stat tick reads it and
+ * answers. The tick is the only writer of the pools and of the active and
+ * overflow masks, so a request cannot race the mask rebuilds of core
+ * compaction, and a grant takes effect within one tick
+ * (LAVD_SYS_STAT_INTERVAL_NS).
+ *
+ * A granted CPU is marked in its cpu_ctx (NETSTACK_CPU_GRANTED, and the
+ * pool that holds it), in its pool's cpumask and in netstack_cpumask, the
+ * union; netstack_free_cpumask holds the online CPUs outside the partition
+ * for the paths that need the complement. Registered threads are marked in
+ * their task_ctx and dispatched from a per-CPU net DSQ; foreign pinned
+ * tasks keep running from the per-CPU DSQ.
  */
 #include <scx/common.bpf.h>
 #include <bpf_arena_common.bpf.h>
@@ -33,35 +43,39 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+_Static_assert(NETSTACK_MAX_POOLS == LAVD_CPDOM_MAX_NR + 1,
+	       "one pool per compute domain and the global one");
+
 /*
  * Options
  */
 const volatile bool	netstack_enabled;
-const volatile u32	netstack_max_cpus;	/* the host's cap on the partition */
-const volatile u32	netstack_min_cpus;
+const volatile u32	netstack_max_cpus;	/* the host's cap on the partition, all pools */
+const volatile u32	netstack_min_cpus;	/* per pool, once it has asked for any */
 const volatile u64	netstack_slice_ns;	/* a registered thread's slice on a partition CPU */
 
 /*
- * The granted CPUs, their complement among the online CPUs, and the
- * candidates of the request being applied.
+ * The granted CPUs of every pool, their union, the online CPUs outside the
+ * partition, and the candidates of the request being applied.
  */
+private(LAVD) struct bpf_cpumask netstack_pool_cpumask[NETSTACK_MAX_POOLS];
 private(LAVD) struct bpf_cpumask __kptr *netstack_cpumask;
 private(LAVD) struct bpf_cpumask __kptr *netstack_free_cpumask;
 private(LAVD) struct bpf_cpumask __kptr *netstack_cand_cpumask;
 
 /*
- * The shared record. One entry, mmapable so that a user space stack can
- * read the grant without a system call.
+ * The shared records, one per pool. Mmapable so that a user space stack
+ * can read a grant without a system call.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
+	__uint(max_entries, NETSTACK_MAX_POOLS);
 	__type(key, u32);
 	__type(value, struct netstack_shm);
 	__uint(map_flags, BPF_F_MMAPABLE);
 } netstack_shm SEC(".maps");
 
-/* The tick's snapshot of the request masks, taken under the seqlock. */
+/* The tick's snapshot of a request's masks, taken under the seqlock. */
 static u64		req_candidates[NETSTACK_MASK_WORDS];
 static u64		req_drop[NETSTACK_MASK_WORDS];
 static u64		last_nr_cpus_onln;
@@ -72,11 +86,14 @@ static u64		last_nr_cpus_onln;
  */
 static u32		resize_nr;
 
-static __always_inline struct netstack_shm *netstack_rec(void)
+static __always_inline u32 nr_pools(void)
 {
-	u32 zero = 0;
+	return 1 + nr_cpdoms;
+}
 
-	return bpf_map_lookup_elem(&netstack_shm, &zero);
+static __always_inline struct netstack_shm *netstack_rec(u32 pool)
+{
+	return bpf_map_lookup_elem(&netstack_shm, &pool);
 }
 
 static __always_inline bool mask_test(const u64 *mask, u32 cpu)
@@ -87,62 +104,96 @@ static __always_inline bool mask_test(const u64 *mask, u32 cpu)
 }
 
 /*
- * Register or unregister @p as a network thread. Registration is a field of
- * its own in the task context rather than a flag bit: the scheduler's flag
- * updates are read-modify-writes under the task's rq lock, which a writer
- * from another context would race.
+ * Register or unregister @p as a network thread of @pool. Registration is
+ * a field of its own in the task context rather than a flag bit: the
+ * scheduler's flag updates are read-modify-writes under the task's rq
+ * lock, which a writer from another context would race. The field holds
+ * the pool number plus one, so that zero is unregistered.
  */
 __hidden
-int netstack_register_task(struct task_struct *p, bool on)
+int netstack_register_task(struct task_struct *p, u32 pool, bool on)
 {
-	struct netstack_shm *s = netstack_rec();
+	struct netstack_shm *s;
 	task_ctx *taskc;
+	u32 cur;
 
-	if (!netstack_enabled || !s)
+	if (!netstack_enabled || pool >= nr_pools())
 		return -ENODEV;
 	taskc = find_task_ctx(p);
 	if (!taskc)
 		return -ESRCH;
-	if (!!READ_ONCE(taskc->netstack) == on)
-		return 0;
-	WRITE_ONCE(taskc->netstack, on);
-	if (on)
+	cur = READ_ONCE(taskc->netstack);
+	if (on) {
+		if (cur == pool + 1)
+			return 0;
+		if (cur)
+			return -EEXIST;	/* of another pool: unregister first */
+		s = netstack_rec(pool);
+		if (!s)
+			return -ENODEV;
+		WRITE_ONCE(taskc->netstack, pool + 1);
 		__sync_fetch_and_add(&s->nr_registered, 1);
-	else
-		__sync_fetch_and_sub(&s->nr_registered, 1);
+	} else {
+		if (!cur)
+			return 0;
+		s = netstack_rec(cur - 1);
+		WRITE_ONCE(taskc->netstack, 0);
+		if (s)
+			__sync_fetch_and_sub(&s->nr_registered, 1);
+	}
 	return 0;
 }
 
-/* A registered thread exits: it leaves the count. */
+/* A registered thread exits: it leaves its pool's count. */
 __hidden
 void netstack_task_exit(task_ctx *taskc)
 {
-	struct netstack_shm *s = netstack_rec();
+	struct netstack_shm *s;
+	u32 cur = taskc->netstack;
 
-	if (!taskc->netstack || !s)
+	if (!cur)
 		return;
 	taskc->netstack = 0;
-	__sync_fetch_and_sub(&s->nr_registered, 1);
+	s = netstack_rec(cur - 1);
+	if (s)
+		__sync_fetch_and_sub(&s->nr_registered, 1);
 }
 
+
 /*
- * Choose the grant for a request and apply it: keep the granted candidates
- * the stack did not drop, most preferred first in lavd's CPU order; add free
- * candidates in that order, whole cores under SMT; release the rest. A CPU
- * that joins leaves the active and overflow sets and is kicked so that its
- * running task is preempted; the first dispatch on it then re-enqueues
- * whatever its local DSQ still holds. A CPU that leaves goes back to the
- * active set; core compaction places it on its next pass.
+ * Choose the grant of @pool for a request and apply it: keep the granted
+ * candidates the stack did not drop, most preferred first in lavd's CPU
+ * order; add free candidates in that order, whole cores under SMT; release
+ * the rest. A CPU that joins leaves the active and overflow sets and is
+ * kicked so that its running task is preempted; the first dispatch on it
+ * then re-enqueues whatever its local DSQ still holds. A CPU that leaves
+ * goes back to the active set; core compaction places it on its next pass.
+ *
+ * A global function so that the verifier checks its loops once, not within
+ * every program that reaches the tick.
  */
-static __noinline int netstack_resize(struct netstack_shm *s, u32 target, u32 flags)
+__weak
+int netstack_resize(u32 pool, u32 target, u32 flags)
 {
-	struct bpf_cpumask *net, *free, *cand, *active, *ovrflw;
+	struct bpf_cpumask *net, *free, *cand, *active, *ovrflw, *pmask;
 	const volatile u16 *cpu_order = get_cpu_order();
 	const struct cpumask *online;
+	struct netstack_shm *s = netstack_rec(pool);
+	struct cpdom_ctx *cpdomc = NULL;
+	struct bpf_cpumask *cd_cpumask = NULL;
 	struct cpu_ctx *cpuc;
-	u32 cap, want, cpu;
+	u32 cap, want, cpu, others, room;
 	int i, words;
 
+	if (!s || pool >= NETSTACK_MAX_POOLS)
+		return -EINVAL;
+	pmask = MEMBER_VPTR(netstack_pool_cpumask, [pool]);
+	if (pool) {
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [pool - 1]);
+		cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [pool - 1]);
+		if (!cpdomc || !cd_cpumask || !cpdomc->is_valid)
+			return -EINVAL;
+	}
 	resize_nr = 0;
 	bpf_rcu_read_lock();
 	net = netstack_cpumask;
@@ -150,24 +201,37 @@ static __noinline int netstack_resize(struct netstack_shm *s, u32 target, u32 fl
 	cand = netstack_cand_cpumask;
 	active = active_cpumask;
 	ovrflw = ovrflw_cpumask;
-	if (!net || !free || !cand || !active || !ovrflw) {
+	if (!net || !free || !cand || !active || !ovrflw || !pmask) {
 		bpf_rcu_read_unlock();
 		return -ENOMEM;
 	}
 
-	/* The host's cap: the operator's, and one CPU at least for the rest. */
-	cap = netstack_max_cpus;
-	if (nr_cpus_onln && cap > nr_cpus_onln - 1)
-		cap = nr_cpus_onln - 1;
+	/*
+	 * The cap: the host's over all pools less what the other pools hold,
+	 * and one CPU at least left to the rest, of the pool's domain for a
+	 * domain pool.
+	 */
+	others = bpf_cpumask_weight(cast_mask(net)) - s->nr_granted;
+	cap = netstack_max_cpus > others ? netstack_max_cpus - others : 0;
+	if (pool)
+		room = bpf_cpumask_weight(cast_mask(cd_cpumask));
+	else
+		room = nr_cpus_onln;
+	room = room > others + 1 ? room - others - 1 : 0;
+	if (cap > room)
+		cap = room;
 	want = target;
-	if (want < netstack_min_cpus)
+	if (want && want < netstack_min_cpus)
 		want = netstack_min_cpus;
 	if (want > cap) {
 		s->nr_denied += want - cap;
 		want = cap;
 	}
 
-	/* The candidates: what the stack offered, or every CPU, online only. */
+	/*
+	 * The candidates: what the stack offered, or every CPU; online, of
+	 * the pool's domain, and not held by another pool.
+	 */
 	online = scx_bpf_get_online_cpumask();
 	if (flags & NETSTACK_REQ_CANDIDATES) {
 		bpf_cpumask_clear(cand);
@@ -182,6 +246,8 @@ static __noinline int netstack_resize(struct netstack_shm *s, u32 target, u32 fl
 		bpf_cpumask_copy(cand, online);
 	}
 	scx_bpf_put_cpumask(online);
+	if (pool)
+		bpf_cpumask_and(cand, cast_mask(cand), cast_mask(cd_cpumask));
 
 	/* Pass 1: keep granted candidates the stack did not drop. */
 	bpf_for(i, 0, nr_cpu_ids) {
@@ -193,6 +259,8 @@ static __noinline int netstack_resize(struct netstack_shm *s, u32 target, u32 fl
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc)
 			break;
+		if (cpuc->netstack_pool != pool)
+			continue;	/* another pool's, or free: not this pass */
 		cpuc->netstack &= ~NETSTACK_CPU_NEXT;
 		if (!(cpuc->netstack & NETSTACK_CPU_GRANTED) || !cpuc->is_online)
 			continue;
@@ -213,6 +281,8 @@ static __noinline int netstack_resize(struct netstack_shm *s, u32 target, u32 fl
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc)
 			break;
+		if (cpuc->netstack_pool != pool && cpuc->netstack_pool)
+			continue;	/* held by another pool */
 		if ((cpuc->netstack & NETSTACK_CPU_NEXT) || !cpuc->is_online ||
 		    !bpf_cpumask_test_cpu(cpu, cast_mask(cand)))
 			continue;
@@ -232,15 +302,18 @@ static __noinline int netstack_resize(struct netstack_shm *s, u32 target, u32 fl
 				sibc = get_cpu_ctx_id(*sibling);
 				if (!sibc || resize_nr + 2 > want ||
 				    !sibc->is_online ||
+				    (sibc->netstack_pool && sibc->netstack_pool != pool) ||
 				    !bpf_cpumask_test_cpu(*sibling, cast_mask(cand)))
 					continue;
 				if (!(sibc->netstack & NETSTACK_CPU_NEXT)) {
 					sibc->netstack |= NETSTACK_CPU_NEXT;
+					sibc->netstack_pool = pool;
 					resize_nr++;
 				}
 			}
 		}
 		cpuc->netstack |= NETSTACK_CPU_NEXT;
+		cpuc->netstack_pool = pool;
 		resize_nr++;
 	}
 
@@ -259,6 +332,16 @@ static __noinline int netstack_resize(struct netstack_shm *s, u32 target, u32 fl
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc)
 			break;
+		if (cpuc->netstack_pool != pool) {
+			/* Another pool's or free: keep the free mask current. */
+			if (!cpuc->netstack_pool) {
+				if (cpuc->is_online)
+					bpf_cpumask_set_cpu(cpu, free);
+				else
+					bpf_cpumask_clear_cpu(cpu, free);
+			}
+			continue;
+		}
 		was = cpuc->netstack & NETSTACK_CPU_GRANTED;
 		now = cpuc->netstack & NETSTACK_CPU_NEXT;
 		if (now) {
@@ -268,14 +351,19 @@ static __noinline int netstack_resize(struct netstack_shm *s, u32 target, u32 fl
 				continue;
 			}
 			cpuc->netstack = NETSTACK_CPU_GRANTED | NETSTACK_CPU_FRESH;
+			bpf_cpumask_set_cpu(cpu, pmask);
 			bpf_cpumask_set_cpu(cpu, net);
 			bpf_cpumask_clear_cpu(cpu, free);
 			bpf_cpumask_clear_cpu(cpu, active);
 			bpf_cpumask_clear_cpu(cpu, ovrflw);
 			scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
 			s->nr_grows++;
-		} else if (was) {
+		} else {
+			cpuc->netstack_pool = 0;
+			if (!was)
+				continue;
 			cpuc->netstack = 0;
+			bpf_cpumask_clear_cpu(cpu, pmask);
 			bpf_cpumask_clear_cpu(cpu, net);
 			if (cpuc->is_online) {
 				bpf_cpumask_set_cpu(cpu, free);
@@ -283,47 +371,34 @@ static __noinline int netstack_resize(struct netstack_shm *s, u32 target, u32 fl
 				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 			}
 			s->nr_shrinks++;
-		} else if (cpuc->is_online) {
-			/* A CPU that came online since the last grant. */
-			bpf_cpumask_set_cpu(cpu, free);
-		} else {
-			bpf_cpumask_clear_cpu(cpu, free);
 		}
 	}
 	s->nr_granted = resize_nr;
 	s->cap = cap;
-	sys_stat.nr_netstack_cpus = resize_nr;
+	sys_stat.nr_netstack_cpus = bpf_cpumask_weight(cast_mask(net));
 	bpf_rcu_read_unlock();
 	return 0;
 }
 
 /*
- * The tick: answer a new request, or reconcile the grant with a CPU that
- * went offline. Runs before core compaction in update_sys_stat(), so the
- * compaction pass that follows sees the new per-CPU marks. A global
- * function, like the compaction, so that the verifier checks its loops once
- * rather than within every program that reaches update_sys_stat().
+ * Answer @pool's request when it has a new one, or when a CPU went offline
+ * since the last grant.
  */
-__weak
-int netstack_tick(void)
+static __always_inline void netstack_apply(u32 pool, bool hotplug)
 {
-	struct netstack_shm *s;
+	struct netstack_shm *s = netstack_rec(pool);
 	u64 seq;
 	u32 target, flags;
 	int i, words;
 
-	if (!netstack_enabled)
-		return 0;
-	s = netstack_rec();
 	if (!s)
-		return 0;
-
+		return;
 	/* A full barrier either side of the snapshot: the record is a seqlock. */
 	seq = __sync_fetch_and_add(&s->req_seq, 0);
 	if (seq & 1)
-		return 0;	/* a write is in progress: next tick */
-	if (seq == READ_ONCE(s->applied_seq) && last_nr_cpus_onln == nr_cpus_onln)
-		return 0;
+		return;		/* a write is in progress: next tick */
+	if (seq == READ_ONCE(s->applied_seq) && !(hotplug && s->nr_granted))
+		return;
 	target = READ_ONCE(s->target);
 	flags = READ_ONCE(s->flags);
 	words = (nr_cpu_ids + 63) / 64;
@@ -334,15 +409,37 @@ int netstack_tick(void)
 		req_drop[i] = READ_ONCE(s->drop[i]);
 	}
 	if (__sync_fetch_and_add(&s->req_seq, 0) != seq)
-		return 0;	/* torn: next tick */
+		return;		/* torn: next tick */
 
 	if (seq != s->applied_seq)
 		s->nr_requests++;
-	last_nr_cpus_onln = nr_cpus_onln;
 	__sync_fetch_and_add(&s->grant_seq, 1);	/* odd: the grant is being written */
-	netstack_resize(s, target, flags);
+	netstack_resize(pool, target, flags);
 	WRITE_ONCE(s->applied_seq, seq);
 	__sync_fetch_and_add(&s->grant_seq, 1);	/* even: the grant is complete */
+}
+
+/*
+ * The tick: answer the pools' new requests, and reconcile every grant with
+ * a CPU that went offline. Runs before core compaction in
+ * update_sys_stat(), so the compaction pass that follows sees the new
+ * per-CPU marks.
+ */
+__weak
+int netstack_tick(void)
+{
+	bool hotplug;
+	u32 pool;
+
+	if (!netstack_enabled)
+		return 0;
+	hotplug = last_nr_cpus_onln != nr_cpus_onln;
+	last_nr_cpus_onln = nr_cpus_onln;
+	bpf_for(pool, 0, nr_pools()) {
+		if (pool >= NETSTACK_MAX_POOLS)
+			break;
+		netstack_apply(pool, hotplug);
+	}
 	return 0;
 }
 
@@ -423,16 +520,18 @@ void netstack_kick(s32 cpu, struct cpu_ctx *cpuc, bool is_idle)
 }
 
 /*
- * Create the net DSQs, one per CPU on its NUMA node, and start the free
- * mask as the online CPUs.
+ * Create the net DSQs, one per CPU on its NUMA node, start the free mask
+ * as the online CPUs, and label the pool records.
  */
 __hidden
 int netstack_init(void)
 {
 	struct bpf_cpumask *free;
 	const struct cpumask *online;
+	struct netstack_shm *s;
 	struct cpdom_ctx *cpdomc;
 	struct cpu_ctx *cpuc;
+	u32 pool;
 	int cpu, err;
 
 	if (!netstack_enabled)
@@ -448,6 +547,16 @@ int netstack_init(void)
 	bpf_rcu_read_unlock();
 	if (!free)
 		return -ENOMEM;
+
+	bpf_for(pool, 0, nr_pools()) {
+		if (pool >= NETSTACK_MAX_POOLS)
+			break;
+		s = netstack_rec(pool);
+		if (!s)
+			return -ENOENT;
+		s->pool = pool;
+		s->cpdom = pool ? pool - 1 : NETSTACK_POOL_GLOBAL_CPDOM;
+	}
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		cpuc = get_cpu_ctx_id(cpu);
@@ -472,7 +581,7 @@ int netstack_init(void)
 }
 
 /*
- * The syscall programs: the stack's side of the record, run with
+ * The syscall programs: the stack's side of the records, run with
  * BPF_PROG_TEST_RUN on the programs pinned under lavd's netstack directory.
  * They are sleepable and run in the caller's context, so every use of a
  * task context is inside an RCU read-side section.
@@ -522,13 +631,13 @@ static int netstack_set_thread(struct netstack_thread_arg *arg, bool on)
 
 	if (!netstack_enabled)
 		return -ENODEV;
-	if (arg->flags)
+	if (arg->flags || arg->pool >= nr_pools())
 		return -EINVAL;
 	p = netstack_arg_task(arg->tid);
 	if (!p)
 		return -ESRCH;
 	bpf_rcu_read_lock();
-	err = netstack_register_task(p, on);
+	err = netstack_register_task(p, arg->pool, on);
 	bpf_rcu_read_unlock();
 	bpf_task_release(p);
 	return err;
@@ -549,12 +658,12 @@ int lavd_netstack_unregister_thread(struct netstack_thread_arg *arg)
 SEC("syscall")
 int lavd_netstack_get_capacity(struct netstack_cap_arg *arg)
 {
-	struct netstack_shm *s = netstack_rec();
+	struct netstack_shm *s;
 	int err;
 
-	if (!netstack_enabled || !s)
+	if (!netstack_enabled)
 		return -ENODEV;
-	if (arg->domain)
+	if (arg->pool >= nr_pools() || !(s = netstack_rec(arg->pool)))
 		return -EINVAL;
 	err = netstack_read_grant(s, &arg->nr_granted, &arg->target, &arg->cap,
 				  &arg->grant_seq, &arg->req_seq, arg->granted);
@@ -566,14 +675,14 @@ int lavd_netstack_get_capacity(struct netstack_cap_arg *arg)
 SEC("syscall")
 int lavd_netstack_request_capacity(struct netstack_req_arg *arg)
 {
-	struct netstack_shm *s = netstack_rec();
+	struct netstack_shm *s;
 	u64 seq;
 	u32 cap, target;
 	int i, err, words = (nr_cpu_ids + 63) / 64;
 
-	if (!netstack_enabled || !s)
+	if (!netstack_enabled)
 		return -ENODEV;
-	if (arg->domain ||
+	if (arg->pool >= nr_pools() || !(s = netstack_rec(arg->pool)) ||
 	    (arg->flags & ~(NETSTACK_REQ_CANDIDATES | NETSTACK_REQ_DROP)))
 		return -EINVAL;	/* the other flags are reserved */
 	if (arg->target_cpus < -1)

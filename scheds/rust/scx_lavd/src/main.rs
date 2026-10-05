@@ -285,17 +285,18 @@ struct Opts {
     #[clap(long = "netstack", action = clap::ArgAction::SetTrue)]
     netstack: bool,
 
-    /// The most CPUs the network partition may hold. 0 selects half of the
-    /// CPUs. lavd always keeps at least one CPU outside the partition.
+    /// The most CPUs the network partition may hold over all its pools. 0
+    /// selects half of the CPUs. lavd always keeps at least one CPU outside
+    /// the partition, and one of each domain outside that domain's pool.
     #[clap(long = "netstack-max-cpus", default_value = "0")]
     netstack_max_cpus: u32,
 
-    /// The fewest CPUs the network partition holds once the stack has asked
-    /// for any.
+    /// The fewest CPUs a network pool holds once the stack has asked it for
+    /// any.
     #[clap(long = "netstack-min-cpus", default_value = "0")]
     netstack_min_cpus: u32,
 
-    /// Grant this CPU list to the network partition at start, as if the
+    /// Grant this CPU list to the global network pool at start, as if the
     /// stack had requested it (e.g., "0-3,8"). The stack may change it
     /// later.
     #[clap(long = "netstack-cpus", default_value = "")]

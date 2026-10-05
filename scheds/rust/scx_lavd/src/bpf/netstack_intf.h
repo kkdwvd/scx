@@ -13,6 +13,16 @@
 #define NETSTACK_CPU_ID_MAX	8192
 #define NETSTACK_MASK_WORDS	(NETSTACK_CPU_ID_MAX / 64)
 
+/*
+ * Pools: the global pool, whose candidates are every CPU, and one pool per
+ * compute domain d (an LLC, or one core type of an LLC) numbered 1 + d,
+ * whose candidates are the domain's CPUs. Each has its own record; the
+ * records are the entries of the shm map, indexed by pool.
+ */
+#define NETSTACK_POOL_GLOBAL		0
+#define NETSTACK_MAX_POOLS		129	/* 1 + LAVD_CPDOM_MAX_NR */
+#define NETSTACK_POOL_GLOBAL_CPDOM	0xffffffffU
+
 /* Request flags. */
 enum {
 	NETSTACK_REQ_CANDIDATES	= 0x1,	/* grant only within the candidates mask */
@@ -46,6 +56,8 @@ struct netstack_shm {
 	u64	nr_shrinks;	/* CPUs released, summed over grants */
 	u64	nr_denied;	/* CPUs requested beyond the cap, summed */
 	u32	nr_registered;	/* registered network threads */
+	u32	pool;		/* this record's pool */
+	u32	cpdom;		/* its compute domain; NETSTACK_POOL_GLOBAL_CPDOM for the global pool */
 	u32	__pad;
 };
 
@@ -55,15 +67,21 @@ struct netstack_shm {
  * unregister_thread, get_capacity, request_capacity.
  */
 
-/* lavd_netstack_register_thread(), lavd_netstack_unregister_thread() */
+/*
+ * lavd_netstack_register_thread(), lavd_netstack_unregister_thread(): a
+ * thread belongs to one pool and runs on its CPUs; unregister it before
+ * registering it with another.
+ */
 struct netstack_thread_arg {
 	s32	tid;		/* the thread, or 0 for the calling thread */
 	u32	flags;		/* reserved: 0 */
+	u32	pool;
+	u32	__pad;
 };
 
 /* lavd_netstack_get_capacity(): the grant in force, returns nr_granted */
 struct netstack_cap_arg {
-	u32	domain;		/* reserved: 0 */
+	u32	pool;
 	u32	nr_granted;
 	u32	target;		/* the request the grant answers */
 	u32	cap;
@@ -80,7 +98,7 @@ struct netstack_cap_arg {
  * answers it. Two requesters racing get -EBUSY for the second.
  */
 struct netstack_req_arg {
-	u32	domain;		/* reserved: 0 */
+	u32	pool;
 	s32	target_cpus;	/* CPUs wanted in all, capped by lavd; -1 keeps the current target */
 	u32	flags;		/* NETSTACK_REQ_* */
 	u32	nr_granted;	/* out */

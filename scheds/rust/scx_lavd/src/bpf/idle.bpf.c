@@ -718,7 +718,7 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 static __always_inline
 s32 netstack_pick_cpu(struct pick_ctx *ctx, bool *is_idle)
 {
-	struct bpf_cpumask *net = netstack_cpumask;
+	struct bpf_cpumask *net = netstack_task_cpumask(ctx->taskc);
 	struct bpf_cpumask *tmp = ctx->cpuc_cur->temp_mask;
 	s32 cpu;
 
