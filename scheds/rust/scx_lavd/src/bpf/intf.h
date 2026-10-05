@@ -82,7 +82,7 @@ struct sys_stat {
 	u32	nr_netstack_cpus; /* CPUs granted to the network soft partition */
 	u32	nr_netstack_borrow; /* of which open to borrowing by other tasks */
 	u32	nr_netstack_quanta; /* of which time-sharing with pinned tasks in quanta */
-	u32	__pad0;
+	u32	nr_netstack_withheld; /* CPUs withheld from the pools for a saturated application */
 };
 
 /*

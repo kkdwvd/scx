@@ -73,6 +73,25 @@ const volatile u32	netstack_borrow_after;	/* intervals */
 const volatile u64	netstack_quanta_net_ns;
 const volatile u64	netstack_quanta_other_ns;
 
+/*
+ * Yield: the host's side of the capacity. While the application's CPUs,
+ * the online CPUs outside the partition, have been netstack_yield_above
+ * busy for netstack_yield_after intervals and a pool holds a CPU whose
+ * registered threads use at most netstack_yield_below of it, lavd withholds
+ * one more CPU from that pool's target, and gives one back after the same
+ * interval below netstack_yield_release. The stack reads the grant, not
+ * its request, and sizes itself to it.
+ */
+const volatile bool	netstack_yield;
+const volatile u32	netstack_yield_above;	/* LAVD_SHIFT fixed-point */
+const volatile u32	netstack_yield_release;
+const volatile u32	netstack_yield_below;
+const volatile u32	netstack_yield_after;	/* intervals */
+static u32		yield_ticks;
+static u32		restore_ticks;
+static u32		demand_ticks;
+static __always_inline void netstack_yield_gate(void);
+
 /* The quanta's per-CPU timer and phase clock. */
 struct netstack_quanta {
 	struct bpf_timer	timer;
@@ -273,6 +292,17 @@ int netstack_resize(u32 pool, u32 target, u32 flags)
 		s->nr_denied += want - cap;
 		want = cap;
 	}
+	/*
+	 * What the yield policy holds back for the application: spare CPUs,
+	 * never the last one of a pool with registered threads, whose load
+	 * could not be measured without it and which would otherwise be
+	 * handed back and withheld again every interval.
+	 */
+	if (want && READ_ONCE(s->nr_registered) && s->withheld >= want)
+		s->withheld = want - 1;
+	else if (s->withheld >= want)
+		s->withheld = want;
+	want -= s->withheld;
 
 	/*
 	 * The candidates: what the stack offered, or every CPU; online, of
@@ -446,7 +476,7 @@ int netstack_resize(u32 pool, u32 target, u32 flags)
  * Answer @pool's request when it has a new one, or when a CPU went offline
  * since the last grant.
  */
-static __always_inline void netstack_apply(u32 pool, bool hotplug)
+static __always_inline void netstack_apply(u32 pool, bool force)
 {
 	struct netstack_shm *s = netstack_rec(pool);
 	u64 seq;
@@ -459,7 +489,7 @@ static __always_inline void netstack_apply(u32 pool, bool hotplug)
 	seq = __sync_fetch_and_add(&s->req_seq, 0);
 	if (seq & 1)
 		return;		/* a write is in progress: next tick */
-	if (seq == READ_ONCE(s->applied_seq) && !(hotplug && s->nr_granted))
+	if (seq == READ_ONCE(s->applied_seq) && !force)
 		return;
 	target = READ_ONCE(s->target);
 	flags = READ_ONCE(s->flags);
@@ -576,7 +606,148 @@ int netstack_tick(void)
 	bpf_rcu_read_lock();
 	netstack_borrow_gate();
 	bpf_rcu_read_unlock();
+	netstack_yield_gate();
 	return 0;
+}
+
+/*
+ * Does @pool hold a CPU its registered threads leave mostly idle? Such a
+ * CPU is what the yield policy takes back: the stack can collapse a thread
+ * there without losing throughput.
+ */
+static __always_inline bool netstack_pool_has_spare(u32 pool)
+{
+	struct cpu_ctx *cpuc;
+	u32 cpu;
+
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (cpu >= LAVD_CPU_ID_MAX)
+			break;
+		cpuc = get_cpu_ctx_id(cpu);
+		if (!cpuc)
+			break;
+		if ((cpuc->netstack & NETSTACK_CPU_GRANTED) && cpuc->netstack_pool == pool &&
+		    cpuc->cur_netstack_util_wall <= netstack_yield_below)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Does @pool need what was withheld from it: registered threads and every
+ * CPU it still holds busy with them, or none left to hold them at all?
+ */
+static __always_inline bool netstack_pool_in_demand(u32 pool)
+{
+	struct netstack_shm *s = netstack_rec(pool);
+	struct cpu_ctx *cpuc;
+	u32 cpu;
+
+	if (!s || !s->withheld || !READ_ONCE(s->nr_registered))
+		return false;
+	if (!s->nr_granted)
+		return true;
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (cpu >= LAVD_CPU_ID_MAX)
+			break;
+		cpuc = get_cpu_ctx_id(cpu);
+		if (!cpuc)
+			break;
+		if ((cpuc->netstack & NETSTACK_CPU_GRANTED) && cpuc->netstack_pool == pool &&
+		    cpuc->cur_netstack_util_wall < netstack_yield_above)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The yield gate: lavd's cap on a saturated host. The application's CPUs
+ * are the online CPUs outside the partition, whose utilization sys_stat
+ * already carries without the partition's. Each step waits the settling
+ * interval, withholds one CPU from one pool that has a spare one, or gives
+ * one back to one pool, and re-applies that pool's request. A pool that
+ * needs what was withheld, its remaining CPUs saturated by its registered
+ * threads or none left, gets a CPU back per interval whatever the
+ * application is doing: the withholding was premised on spare capacity,
+ * and the stack's request stands.
+ */
+static __always_inline void netstack_yield_gate(void)
+{
+	struct netstack_shm *s;
+	u32 pool, nr = 0;
+	bool stepped = false, demand = false;
+
+	if (!netstack_yield)
+		return;
+	bpf_for(pool, 0, nr_pools()) {
+		if (pool >= NETSTACK_MAX_POOLS)
+			break;
+		if (netstack_pool_in_demand(pool))
+			demand = true;
+	}
+	if (demand && ++demand_ticks >= netstack_yield_after) {
+		demand_ticks = 0;
+		bpf_for(pool, 0, nr_pools()) {
+			if (pool >= NETSTACK_MAX_POOLS)
+				break;
+			s = netstack_rec(pool);
+			if (!s || stepped || !netstack_pool_in_demand(pool))
+				continue;
+			s->withheld--;
+			s->nr_restores++;
+			stepped = true;
+			netstack_apply(pool, true);
+		}
+	} else if (!demand) {
+		demand_ticks = 0;
+	}
+	if (stepped) {
+		yield_ticks = 0;
+	} else if (sys_stat.avg_util_wall >= netstack_yield_above) {
+		restore_ticks = 0;
+		if (++yield_ticks >= netstack_yield_after) {
+			yield_ticks = 0;
+			bpf_for(pool, 0, nr_pools()) {
+				if (pool >= NETSTACK_MAX_POOLS)
+					break;
+				s = netstack_rec(pool);
+				if (!s || stepped || !s->nr_granted ||
+				    !netstack_pool_has_spare(pool))
+					continue;
+				s->withheld++;
+				s->nr_yields++;
+				stepped = true;
+				netstack_apply(pool, true);
+			}
+		}
+	} else if (sys_stat.avg_util_wall <= netstack_yield_release) {
+		yield_ticks = 0;
+		if (++restore_ticks >= netstack_yield_after) {
+			restore_ticks = 0;
+			bpf_for(pool, 0, nr_pools()) {
+				if (pool >= NETSTACK_MAX_POOLS)
+					break;
+				s = netstack_rec(pool);
+				if (!s || stepped || !s->withheld)
+					continue;
+				s->withheld--;
+				s->nr_restores++;
+				stepped = true;
+				netstack_apply(pool, true);
+			}
+		}
+	} else {
+		yield_ticks = 0;
+		restore_ticks = 0;
+	}
+	bpf_for(pool, 0, nr_pools()) {
+		if (pool >= NETSTACK_MAX_POOLS)
+			break;
+		s = netstack_rec(pool);
+		if (s)
+			nr += s->withheld;
+	}
+	sys_stat.nr_netstack_withheld = nr;
 }
 
 /*

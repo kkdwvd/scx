@@ -342,6 +342,36 @@ struct Opts {
     #[clap(long = "netstack-quanta-us", default_value = "0,0")]
     netstack_quanta_us: String,
 
+    /// Yield partition capacity to a saturated application: while the CPUs
+    /// outside the partition have been --netstack-yield-above-pct busy for
+    /// --netstack-yield-after-ms and a pool holds a CPU whose registered
+    /// threads use at most --netstack-yield-below-pct of it, lavd withholds
+    /// one more CPU from that pool's target, and gives one back after the
+    /// same time below --netstack-yield-release-pct. The stack sizes itself
+    /// to the grant it reads.
+    #[clap(long = "netstack-yield", action = clap::ArgAction::SetTrue)]
+    netstack_yield: bool,
+
+    /// Application-side utilization, in percent, at or above which lavd
+    /// withholds partition CPUs.
+    #[clap(long = "netstack-yield-above-pct", default_value = "90")]
+    netstack_yield_above_pct: u8,
+
+    /// Application-side utilization, in percent, at or below which lavd
+    /// gives withheld CPUs back.
+    #[clap(long = "netstack-yield-release-pct", default_value = "70")]
+    netstack_yield_release_pct: u8,
+
+    /// Registered threads' share of a partition CPU, in percent, at or below
+    /// which the CPU counts as spare for the yield policy.
+    #[clap(long = "netstack-yield-below-pct", default_value = "50")]
+    netstack_yield_below_pct: u8,
+
+    /// How long, in milliseconds, each condition has to hold before the
+    /// yield policy withholds or returns a CPU.
+    #[clap(long = "netstack-yield-after-ms", default_value = "1000")]
+    netstack_yield_after_ms: u32,
+
     /// Directory in bpffs under which the netstack programs and record are
     /// pinned for the stack: register_thread, unregister_thread,
     /// get_capacity, request_capacity and shm.
@@ -501,6 +531,14 @@ impl Opts {
                     || self.netstack_borrow_above_pct > 100)
             {
                 info!("--netstack-borrow needs below <= above <= 100.");
+                return None;
+            }
+            if self.netstack_yield
+                && (self.netstack_yield_release_pct > self.netstack_yield_above_pct
+                    || self.netstack_yield_above_pct > 100
+                    || self.netstack_yield_below_pct > 100)
+            {
+                info!("--netstack-yield needs release <= above <= 100 and below <= 100.");
                 return None;
             }
             if self.netstack_min_cpus > 0
@@ -969,6 +1007,11 @@ impl<'a> Scheduler<'a> {
             Opts::parse_quanta(&opts.netstack_quanta_us).unwrap_or((0, 0));
         rodata.netstack_quanta_net_ns = quanta_net * 1000;
         rodata.netstack_quanta_other_ns = quanta_other * 1000;
+        rodata.netstack_yield = opts.netstack_yield;
+        rodata.netstack_yield_above = ((opts.netstack_yield_above_pct as u32) << 10) / 100;
+        rodata.netstack_yield_release = ((opts.netstack_yield_release_pct as u32) << 10) / 100;
+        rodata.netstack_yield_below = ((opts.netstack_yield_below_pct as u32) << 10) / 100;
+        rodata.netstack_yield_after = std::cmp::max(1, opts.netstack_yield_after_ms / 10);
         // Replenishment wakes dispatch through the built-in idle tracking.
         rodata.bw_kick_builtin_idle = true;
 
@@ -1167,6 +1210,7 @@ impl<'a> Scheduler<'a> {
                 let nr_net = st.nr_netstack_cpus;
                 let nr_borrow = st.nr_netstack_borrow;
                 let nr_quanta = st.nr_netstack_quanta;
+                let nr_withheld = st.nr_netstack_withheld;
                 let nr_sched = st.nr_sched;
                 let nr_preempt = st.nr_preempt;
                 let pc_pc = Self::get_pc(st.nr_perf_cri, nr_sched);
@@ -1192,6 +1236,7 @@ impl<'a> Scheduler<'a> {
                     nr_net,
                     nr_borrow,
                     nr_quanta,
+                    nr_withheld,
                     nr_sched,
                     nr_preempt,
                     pc_pc,

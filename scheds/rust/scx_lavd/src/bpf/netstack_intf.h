@@ -56,6 +56,10 @@ struct netstack_shm {
 	u64	nr_shrinks;	/* CPUs released, summed over grants */
 	u64	nr_denied;	/* CPUs requested beyond the cap, summed */
 	u64	nr_quanta_kicks; /* phase boundaries that preempted the running task */
+	u32	withheld;	/* CPUs lavd holds back from this pool's target for a saturated application */
+	u32	__pad1;
+	u64	nr_yields;	/* CPUs withheld, summed */
+	u64	nr_restores;	/* CPUs given back, summed */
 	u32	nr_registered;	/* registered network threads */
 	u32	pool;		/* this record's pool */
 	u32	cpdom;		/* its compute domain; NETSTACK_POOL_GLOBAL_CPDOM for the global pool */

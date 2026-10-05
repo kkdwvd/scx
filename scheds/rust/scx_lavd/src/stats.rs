@@ -37,6 +37,9 @@ pub struct SysStats {
     #[stat(desc = "Number of partition CPUs time-sharing with pinned tasks in quanta")]
     pub nr_quanta: u32,
 
+    #[stat(desc = "Number of CPUs withheld from the network pools for a saturated application")]
+    pub nr_withheld: u32,
+
     #[stat(desc = "Number of context switches")]
     pub nr_sched: u64,
 
@@ -81,13 +84,14 @@ impl SysStats {
     pub fn format_header<W: Write>(w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "\x1b[93m| {:8} | {:9} | {:9} | {:5} | {:6} | {:6} | {:8} | {:9} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:11} | {:12} | {:12} | {:12} |\x1b[0m",
+            "\x1b[93m| {:8} | {:9} | {:9} | {:5} | {:6} | {:6} | {:6} | {:8} | {:9} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:11} | {:12} | {:12} | {:12} |\x1b[0m",
             "MSEQ",
             "# Q TASK",
             "# ACT CPU",
             "# NET",
             "# BORR",
             "# QNTA",
+            "# HELD",
             "# SCHED",
             "# PREEMPT",
             "PERF-CR%",
@@ -118,13 +122,14 @@ impl SysStats {
 
         writeln!(
             w,
-            "{color}| {:8} | {:9} | {:9} | {:5} | {:6} | {:6} | {:8} | {:9} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:11} | {:12} | {:12} | {:12} |\x1b[0m",
+            "{color}| {:8} | {:9} | {:9} | {:5} | {:6} | {:6} | {:6} | {:8} | {:9} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:11} | {:12} | {:12} | {:12} |\x1b[0m",
             self.mseq,
             self.nr_queued_task,
             self.nr_active,
             self.nr_net,
             self.nr_borrow,
             self.nr_quanta,
+            self.nr_withheld,
             self.nr_sched,
             self.nr_preempt,
             GPoint(self.pc_pc),
