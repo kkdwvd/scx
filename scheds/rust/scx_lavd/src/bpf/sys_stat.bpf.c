@@ -143,6 +143,8 @@ static void collect_sys_stat(void)
 				cpu = (i * 64) + j;
 				if (cpu >= nr_cpu_ids)
 					break;
+				if (cpu_is_netstack(cpu))
+					continue;
 
 				cpdomc->nr_queued_task += scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
 				if (use_per_cpu_dsq() && cpu == get_primary_cpu(cpu))
@@ -456,6 +458,13 @@ static void collect_sys_stat(void)
 		cpuc->prev_pelt_clk = now_pelt;
 
 		/*
+		 * The partition's CPUs are not the application's capacity:
+		 * they stay out of the system-wide sums that size it.
+		 */
+		if (cpuc_is_netstack(cpuc))
+			continue;
+
+		/*
 		 * Accumulate cpus' scaled loads,
 		 * which is capacity and frequency invariant.
 		 */
@@ -585,9 +594,10 @@ static void collect_sys_stat(void)
 		}
 
 		/*
-		 * Accumulate system-wide idle time.
+		 * Accumulate system-wide idle time, the partition's left out.
 		 */
-		c->idle_total_wall += cpuc->idle_total_wall;
+		if (!cpuc_is_netstack(cpuc))
+			c->idle_total_wall += cpuc->idle_total_wall;
 		cpuc->idle_total_wall = 0;
 	}
 }
@@ -602,7 +612,9 @@ static void calc_sys_stat(void)
 	 * Calculate the CPU utilization that includes everything
 	 * — scx tasks, non-scx tasks (e.g., RT/DL), IRQ, etc.
 	 */
-	c->duration_total_wall = (c->duration_wall * nr_cpus_onln) ? : 1;
+	c->duration_total_wall = (c->duration_wall *
+				  (nr_cpus_onln - min(sys_stat.nr_netstack_cpus,
+						      nr_cpus_onln))) ? : 1;
 	c->compute_total_wall = time_delta(c->duration_total_wall, c->idle_total_wall);
 	c->cur_util_wall = (c->compute_total_wall << LAVD_SHIFT) / c->duration_total_wall;
 
@@ -799,6 +811,12 @@ int update_sys_stat(void)
 	 */
 	if (is_autopilot_on)
 		do_autopilot();
+
+	/*
+	 * Answer the network stack's capacity request, before the mask
+	 * rebuilds below so that they see the new partition.
+	 */
+	netstack_tick();
 
 	/*
 	 * Perform core compaction for powersave and balance mode.

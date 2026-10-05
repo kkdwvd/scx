@@ -37,6 +37,7 @@ use crossbeam::channel::RecvTimeoutError;
 use crossbeam::channel::Sender;
 use crossbeam::channel::TrySendError;
 use libbpf_rs::AsRawLibbpf;
+use libbpf_rs::MapCore;
 use libbpf_rs::OpenObject;
 use libbpf_rs::PrintLevel;
 use libbpf_rs::ProgramInput;
@@ -46,6 +47,7 @@ use libc::c_char;
 use plain::Plain;
 use scx_arena::ArenaLib;
 use scx_stats::prelude::*;
+use scx_utils::Cpumask;
 use scx_utils::EnergyModel;
 use scx_utils::NR_CPU_IDS;
 use scx_utils::TopologyArgs;
@@ -277,6 +279,30 @@ struct Opts {
     #[clap(long = "no-freq-scaling", action = clap::ArgAction::SetTrue)]
     no_freq_scaling: bool,
 
+    /// Reserve a network soft partition: a dynamically sized set of CPUs
+    /// that a network stack grows and shrinks through the netstack record
+    /// and that other tasks stay off. Cannot be used with --per-cpu-dsq or
+    /// --warm-cpu-us, whose per-CPU queues would carry other tasks onto the
+    /// partition's CPUs.
+    #[clap(long = "netstack", action = clap::ArgAction::SetTrue)]
+    netstack: bool,
+
+    /// The most CPUs the network partition may hold. 0 selects half of the
+    /// CPUs. lavd always keeps at least one CPU outside the partition.
+    #[clap(long = "netstack-max-cpus", default_value = "0")]
+    netstack_max_cpus: u32,
+
+    /// The fewest CPUs the network partition holds once the stack has asked
+    /// for any.
+    #[clap(long = "netstack-min-cpus", default_value = "0")]
+    netstack_min_cpus: u32,
+
+    /// Grant this CPU list to the network partition at start, as if the
+    /// stack had requested it (e.g., "0-3,8"). The stack may change it
+    /// later.
+    #[clap(long = "netstack-cpus", default_value = "")]
+    netstack_cpus: String,
+
     /// Enable stats monitoring with the specified interval.
     #[clap(long)]
     stats: Option<f64>,
@@ -415,6 +441,27 @@ impl Opts {
         }
         if self.no_use_em {
             info!("Energy model won't be used for CPU preference order.");
+        }
+
+        if self.netstack {
+            if self.per_cpu_dsq || self.warm_cpu_us > 0 {
+                info!("--netstack cannot be used with --per-cpu-dsq or --warm-cpu-us.");
+                return None;
+            }
+            if self.netstack_min_cpus > 0
+                && self.netstack_max_cpus > 0
+                && self.netstack_min_cpus > self.netstack_max_cpus
+            {
+                info!("--netstack-min-cpus must not exceed --netstack-max-cpus.");
+                return None;
+            }
+            if !self.netstack_cpus.is_empty()
+                && Cpumask::from_cpulist(&self.netstack_cpus).is_err()
+            {
+                info!("--netstack-cpus is not a CPU list.");
+                return None;
+            }
+            info!("Network soft partition is enabled.");
         }
 
         if let Some(pinned_slice) = self.pinned_slice_us {
@@ -559,6 +606,11 @@ impl<'a> Scheduler<'a> {
         let mut skel = scx_ops_load!(skel, lavd_ops, uei)?;
         let task_size = std::mem::size_of::<types::task_ctx>();
         let arenalib = ArenaLib::setup(skel.object_mut(), task_size, 0, *NR_CPU_IDS)?;
+
+        // The initial partition, requested on the stack's behalf.
+        if opts.netstack && !opts.netstack_cpus.is_empty() {
+            Self::request_netstack_cpus(&mut skel, &opts.netstack_cpus)?;
+        }
 
         // Attach.
         let struct_ops = Some(scx_ops_attach!(skel, lavd_ops)?);
@@ -720,6 +772,33 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Write the request for @cpulist into the netstack record, as the
+    /// stack would: its CPUs as the candidates and its size as the target.
+    fn request_netstack_cpus(skel: &mut BpfSkel, cpulist: &str) -> Result<()> {
+        let mask = Cpumask::from_cpulist(cpulist)?;
+        let mut rec: netstack_shm = unsafe { mem::MaybeUninit::zeroed().assume_init() };
+
+        for cpu in mask.iter() {
+            rec.candidates[cpu / 64] |= 1u64 << (cpu % 64);
+        }
+        rec.target = mask.weight() as u32;
+        rec.flags = NETSTACK_REQ_CANDIDATES;
+        rec.req_seq = 2;
+
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &rec as *const netstack_shm as *const u8,
+                mem::size_of::<netstack_shm>(),
+            )
+        };
+        skel.maps
+            .netstack_shm
+            .update(&0u32.to_ne_bytes(), bytes, libbpf_rs::MapFlags::ANY)
+            .context("Failed to write the initial netstack request")?;
+        info!("Network partition requested for CPUs {cpulist}.");
+        Ok(())
+    }
+
     fn init_globals(
         skel: &mut OpenBpfSkel,
         opts: &Opts,
@@ -754,6 +833,13 @@ impl<'a> Scheduler<'a> {
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
         rodata.enable_cpu_bw = opts.enable_cpu_bw;
+        rodata.netstack_enabled = opts.netstack;
+        rodata.netstack_max_cpus = if opts.netstack_max_cpus > 0 {
+            opts.netstack_max_cpus
+        } else {
+            std::cmp::max(1, (*NR_CPU_IDS as u32) / 2)
+        };
+        rodata.netstack_min_cpus = opts.netstack_min_cpus;
         // Replenishment wakes dispatch through the built-in idle tracking.
         rodata.bw_kick_builtin_idle = true;
 
@@ -949,6 +1035,7 @@ impl<'a> Scheduler<'a> {
                 let mseq = self.mseq_id;
                 let nr_queued_task = st.nr_queued_task;
                 let nr_active = st.nr_active;
+                let nr_net = st.nr_netstack_cpus;
                 let nr_sched = st.nr_sched;
                 let nr_preempt = st.nr_preempt;
                 let pc_pc = Self::get_pc(st.nr_perf_cri, nr_sched);
@@ -971,6 +1058,7 @@ impl<'a> Scheduler<'a> {
                     mseq,
                     nr_queued_task,
                     nr_active,
+                    nr_net,
                     nr_sched,
                     nr_preempt,
                     pc_pc,

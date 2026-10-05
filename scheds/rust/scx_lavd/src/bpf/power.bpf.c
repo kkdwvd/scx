@@ -273,7 +273,7 @@ static int calc_nr_active_cpus(void)
 				break;
 
 			cpuc = get_cpu_ctx_id(cpu);
-			if (!cpuc || !cpuc->is_online)
+			if (!cpuc || !cpuc->is_online || cpuc_is_netstack(cpuc))
 				continue;
 
 			eff_cap = cpuc->effective_capacity; 
@@ -305,7 +305,7 @@ static int calc_nr_active_cpus(void)
 						break;
 
 					cpuc = get_cpu_ctx_id(cpu);
-					if (!cpuc || !cpuc->is_online)
+					if (!cpuc || !cpuc->is_online || cpuc_is_netstack(cpuc))
 						continue;
 
 					eff_cap = cpuc->effective_capacity; 
@@ -370,6 +370,17 @@ int do_core_compaction(void)
 		cpu = cpu_order[i];
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc || !cpuc->is_online) {
+			bpf_cpumask_clear_cpu(cpu, active);
+			ovrflw_test_and_clear(ovrflw, cpu);
+			continue;
+		}
+
+		/*
+		 * A CPU of the network partition belongs to neither set; it
+		 * keeps its position in the order so that the index below
+		 * stays the boundary of the active prefix.
+		 */
+		if (cpuc_is_netstack(cpuc)) {
 			bpf_cpumask_clear_cpu(cpu, active);
 			ovrflw_test_and_clear(ovrflw, cpu);
 			continue;
@@ -733,7 +744,7 @@ int reinit_active_cpumask_for_performance(void)
 			cpuc = get_cpu_ctx_id(cpu);
 			if (!cpuc)
 				continue;
-			if (!cpuc->is_online) {
+			if (!cpuc->is_online || cpuc_is_netstack(cpuc)) {
 				bpf_cpumask_clear_cpu(cpu, active);
 				ovrflw_test_and_clear(ovrflw, cpu);
 				continue;
@@ -766,6 +777,10 @@ int reinit_active_cpumask_for_performance(void)
 			cpuc = get_cpu_ctx_id(cpu);
 			if (!cpuc || !cpuc->is_online)
 				continue;
+			if (cpuc_is_netstack(cpuc)) {
+				bpf_cpumask_clear_cpu(cpu, active);
+				continue;
+			}
 
 			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 
@@ -839,7 +854,8 @@ int calc_cpuperf_target(struct cpu_ctx *cpuc)
 	 * them twice.
 	 */
 	cap = scx_bpf_cpuperf_cap(cpuc->cpu_id);
-	if (no_freq_scaling) {
+	if (no_freq_scaling || cpuc_is_netstack(cpuc)) {
+		/* A partition CPU runs at full performance for its packets. */
 		cpuperf_target = cap;
 	} else {
 		max_util_wall = max(scx_only_util(cpuc->avg_util_wall,

@@ -13,6 +13,7 @@ fn main() {
         .add_source("src/bpf/introspec.bpf.c")
         .add_source("src/bpf/lat_cri.bpf.c")
         .add_source("src/bpf/lock.bpf.c")
+        .add_source("src/bpf/netstack.bpf.c")
         .add_source("src/bpf/power.bpf.c")
         .add_source("src/bpf/preempt.bpf.c")
         .add_source("src/bpf/sys_stat.bpf.c")

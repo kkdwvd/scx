@@ -58,6 +58,15 @@ enum {
 };
 
 /*
+ * A CPU's membership of the network soft partition (cpu_ctx.netstack).
+ */
+enum consts_netstack {
+	NETSTACK_CPU_GRANTED		= 0x1, /* in the partition */
+	NETSTACK_CPU_FRESH		= 0x2, /* granted since its last dispatch */
+	NETSTACK_CPU_NEXT		= 0x4, /* scratch of the grant being computed */
+};
+
+/*
  * common constants
  */
 enum consts_internal {
@@ -358,6 +367,16 @@ struct cpu_ctx *get_cpu_ctx(void);
 struct cpu_ctx *get_cpu_ctx_id(s32 cpu_id);
 struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 
+/* The network soft partition (netstack.bpf.c). */
+extern const volatile bool	netstack_enabled;
+extern struct bpf_cpumask __kptr *netstack_cpumask;	/* the granted CPUs */
+extern struct bpf_cpumask __kptr *netstack_free_cpumask; /* online CPUs outside the partition */
+extern struct bpf_cpumask __kptr *netstack_cand_cpumask;
+
+int netstack_init(void);
+int netstack_tick(void);
+void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc);
+
 /*
  * CPU context
  */
@@ -386,7 +405,8 @@ struct cpu_ctx {
 	u8		llc_id;		/* llc domain id */
 	u8		cpdom_alt_id;	/* compute domain id of alternative type */
 	u8		is_online;	/* is this CPU online? */
-	u8		__pad0[2];
+	u8		netstack;	/* NETSTACK_CPU_*: in the network soft partition */
+	u8		__pad0;
 	volatile s32	futex_op;	/* futex op in futex V1 */
 
 	/* --- cacheline 1 boundary (64 bytes): write accumulators --- */
@@ -820,16 +840,38 @@ struct dsq_entry {
 u64 peek_dsq_vtime(u64 dsq_id);
 void sort_dsqs(struct dsq_entry *a, struct dsq_entry *b, struct dsq_entry *c);
 
+/* Network soft partition helpers. */
+
+/* Is @cpu granted to the network partition? */
+static __always_inline bool cpu_is_netstack(s32 cpu)
+{
+	struct cpu_ctx *cpuc;
+
+	if (!netstack_enabled)
+		return false;
+	cpuc = get_cpu_ctx_id(cpu);
+	return cpuc && (cpuc->netstack & NETSTACK_CPU_GRANTED);
+}
+
+static __always_inline bool cpuc_is_netstack(struct cpu_ctx *cpuc)
+{
+	return netstack_enabled && (cpuc->netstack & NETSTACK_CPU_GRANTED);
+}
+
 /* Overflow-set bookkeeping helpers. */
 
 /*
  * Atomically add @cpu to the global overflow cpumask. Mirrors the return
  * semantics of bpf_cpumask_test_and_set_cpu(): true if the bit was
- * already set, false if it was newly set.
+ * already set, false if it was newly set. A partition CPU never joins the
+ * overflow set: the callers that reach here with one have already chosen
+ * it for a task that can run nowhere else, and that is where it stays.
  */
 static __always_inline bool
 ovrflw_test_and_set(struct bpf_cpumask *ovrflw, s32 cpu)
 {
+	if (cpu_is_netstack(cpu))
+		return true;
 	return bpf_cpumask_test_and_set_cpu(cpu, ovrflw);
 }
 
@@ -927,6 +969,7 @@ s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur);
 s32  pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle);
 
 bool consume_task(u64 cpdom_id);
+void consume_prev(struct task_struct *prev, task_ctx *taskc_prev, struct cpu_ctx *cpuc);
 
 extern u64 cur_logical_clk;
 u64 calc_when_to_run(struct task_struct *p, task_ctx *taskc);

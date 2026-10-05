@@ -1447,6 +1447,15 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 	}
 
+	/*
+	 * A CPU of the network partition serves the pinned tasks that can
+	 * run nowhere else, never the shared queues; this comes before the
+	 * shortcut below, which does not look at the masks.
+	 */
+	if (cpuc_is_netstack(cpuc)) {
+		netstack_dispatch(cpu, prev, cpuc);
+		return;
+	}
 
 	/*
 	 * If all CPUs are using, directly consume without checking CPU masks.
@@ -2435,6 +2444,18 @@ static int init_cpumasks(void)
 	err = calloc_cpumask(&steady_cpumask);
 	if (err)
 		goto out;
+
+	err = calloc_cpumask(&netstack_cpumask);
+	if (err)
+		goto out;
+
+	err = calloc_cpumask(&netstack_free_cpumask);
+	if (err)
+		goto out;
+
+	err = calloc_cpumask(&netstack_cand_cpumask);
+	if (err)
+		goto out;
 out:
 	bpf_rcu_read_unlock();
 	return err;
@@ -2779,6 +2800,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 		if (err)
 			return err;
 	}
+
+	/*
+	 * Initialize the network soft partition.
+	 */
+	err = netstack_init();
+	if (err)
+		return err;
 
 	/*
 	 * Initialize the last update clock and the update timer to track

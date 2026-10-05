@@ -78,6 +78,9 @@ struct sys_stat {
 	u64	nr_big;		/* scheduled on big core */
 	u64	nr_pc_on_big;	/* performance-critical tasks scheduled on big core */
 	u64	nr_lc_on_big;	/* latency-critical tasks scheduled on big core */
+
+	u32	nr_netstack_cpus; /* CPUs granted to the network soft partition */
+	u32	__pad0;
 };
 
 /*
@@ -165,5 +168,10 @@ enum {
 struct power_arg {
 	s32	power_mode;
 };
+
+/*
+ * The network soft partition
+ */
+#include "netstack_intf.h"
 
 #endif /* __INTF_H */
