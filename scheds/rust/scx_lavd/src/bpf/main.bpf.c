@@ -1870,6 +1870,7 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	unaccount_queued_load(taskc);
 	unaccount_queued_load_pcpu(taskc);
 	cpuc->netstack_curr = taskc->netstack;
+	cpuc->netstack_curr_pinned = !taskc->netstack && is_effectively_pinned(taskc);
 	if (cpuc_is_netstack(cpuc)) {
 		/*
 		 * A partition CPU running anything but a registered thread is
@@ -2000,10 +2001,16 @@ void BPF_STRUCT_OPS(lavd_stopping, struct task_struct *p, bool runnable)
 
 	update_stat_for_stopping(p, taskc, cpuc);
 
+	/*
+	 * A registered thread leaving a partition CPU makes it available to
+	 * another. The CPU's marks of what runs on it are left to the next
+	 * ops.running(): ops.stopping() runs before the ENQ_LAST enqueue of
+	 * the same thread, and a mark cleared here made that enqueue kick the
+	 * pinned task about to run, a few microseconds into its slice.
+	 */
 	if (taskc->netstack && cpuc_is_netstack(cpuc)) {
 		struct bpf_cpumask *avail;
 
-		cpuc->netstack_curr = 0;
 		bpf_rcu_read_lock();
 		avail = netstack_avail_cpumask;
 		if (avail)

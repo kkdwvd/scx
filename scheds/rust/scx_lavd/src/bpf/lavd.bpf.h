@@ -560,7 +560,8 @@ struct cpu_ctx {
 	volatile u32	max_freq;	/* maximum CPU frequency averaged across multiple intervals */
 	u8		netstack_pool;	/* the network pool holding this CPU, or 0 */
 	u8		netstack_idle_ticks; /* consecutive intervals under the borrowing threshold */
-	u8		__pad2[2];
+	u8		netstack_curr_pinned; /* the running task is pinned here and not registered */
+	u8		__pad2;
 	/*
 	 * Snapshot of scx_clock_task() taken at the end of the last
 	 * collect_sys_stat() interval. scx_clock_task() advances during tasks

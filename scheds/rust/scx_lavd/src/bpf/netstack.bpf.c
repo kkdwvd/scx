@@ -644,14 +644,18 @@ void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc)
 
 /*
  * Kick the CPU a registered thread was queued on: preempt whatever runs
- * there unless it is another registered thread, which keeps its turn.
+ * there unless it is another registered thread, which keeps its turn, or
+ * a pinned task that can run nowhere else, which keeps its short slice.
+ * Without the second exception a spinning poller starved the pinned
+ * kthreads of its CPU: re-queued at the end of every slice, it preempted
+ * them a few microseconds into theirs.
  */
 __hidden
 void netstack_kick(s32 cpu, struct cpu_ctx *cpuc, bool is_idle)
 {
 	if (is_idle)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-	else if (!cpuc->netstack_curr)
+	else if (!cpuc->netstack_curr && !cpuc->netstack_curr_pinned)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
 }
 
