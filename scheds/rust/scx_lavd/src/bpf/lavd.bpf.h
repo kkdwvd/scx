@@ -710,7 +710,11 @@ void task_update_cpu_warmth(task_ctx __arg_arena *taskc, struct cpu_ctx *cpuc,
 
 static __always_inline bool use_per_cpu_dsq(void)
 {
-	return per_cpu_dsq || pinned_slice_ns || warm_cpu_ns;
+	/*
+	 * The network partition serves the pinned tasks of its CPUs from
+	 * their per-CPU DSQs, so it keeps them whatever the slice option.
+	 */
+	return per_cpu_dsq || pinned_slice_ns || warm_cpu_ns || netstack_enabled;
 }
 
 static __always_inline  bool is_per_cpu_dsq_migratable(void)

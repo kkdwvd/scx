@@ -1008,21 +1008,30 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		}
 
 		/*
-		 * Recompute the deadline: the logical clock may have advanced
-		 * while the task was bounced, so reusing the stale (smaller)
-		 * deadline would over-prioritize it. Re-anchor to the current
-		 * clock.
+		 * The cached CPU may have joined the network partition since
+		 * it was chosen, as it has when a freshly granted CPU flushes
+		 * its local DSQ: under per-CPU DSQs the fast path below would
+		 * queue the task on that CPU's own queue, which the partition's
+		 * dispatch serves. Such a task is placed afresh instead.
 		 */
-		p->scx.dsq_vtime = calc_when_to_run(p, taskc);
+		if (!(cpuc_is_netstack(cpuc) && !taskc->netstack)) {
+			/*
+			 * Recompute the deadline: the logical clock may have
+			 * advanced while the task was bounced, so reusing the
+			 * stale (smaller) deadline would over-prioritize it.
+			 * Re-anchor to the current clock.
+			 */
+			p->scx.dsq_vtime = calc_when_to_run(p, taskc);
 
-		dsq_id = get_target_dsq_id(p, cpuc, taskc);
-		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
-					 p->scx.dsq_vtime, enq_flags);
-		if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_NET) {
-			netstack_kick(cpu, cpuc, false);
-			return;
+			dsq_id = get_target_dsq_id(p, cpuc, taskc);
+			scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
+						 p->scx.dsq_vtime, enq_flags);
+			if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_NET) {
+				netstack_kick(cpu, cpuc, false);
+				return;
+			}
+			goto kick_cpu_out;
 		}
-		goto kick_cpu_out;
 	}
 
 	/*
@@ -1472,39 +1481,56 @@ bool scan_dsq_for_ovflw_ext(u64 dsq_id, s32 cpu,
 
 /*
  * Move @prev, runnable on a CPU that now belongs to the network partition,
- * to its domain queue and wake an active CPU for it. A pinned or
- * migration-disabled task stays: it can run nowhere else, and the per-CPU
- * DSQ serves it.
+ * to an active CPU: one of its own domain when it has one, idle if
+ * possible, and the queue that CPU consumes, its domain's or, under per-CPU
+ * DSQs, its own. A pinned or migration-disabled task stays: it can run
+ * nowhere else, and the per-CPU DSQ serves it.
  */
 static bool netstack_evict(struct task_struct *prev, struct cpu_ctx *cpuc)
 {
 	task_ctx *taskc = get_task_ctx(prev);
-	struct bpf_cpumask *active, *tmp;
+	struct bpf_cpumask *active, *tmp, *cd_cpumask;
+	struct cpu_ctx *tcpuc;
 	u64 dsq_id;
-	s32 cpu;
+	s32 cpu = -ENOENT;
 
 	if (!taskc || taskc->netstack || is_effectively_pinned(taskc) ||
 	    is_migration_disabled(prev))
 		return false;
 
-	dsq_id = get_target_dsq_id(prev, cpuc, taskc);
-	if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
-		return false;
-	scx_bpf_task_set_dsq_vtime(prev, calc_when_to_run(prev, taskc));
-	scx_bpf_dsq_insert_vtime(prev, dsq_id, sys_stat.slice_wall,
-				 prev->scx.dsq_vtime, 0);
-	account_queued_load(taskc, cpuc->cpdom_id);
-
 	bpf_rcu_read_lock();
 	active = active_cpumask;
 	tmp = cpuc->temp_mask;
+	cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [cpuc->cpdom_id]);
 	if (active && tmp) {
-		bpf_cpumask_and(tmp, cast_mask(active), prev->cpus_ptr);
-		cpu = scx_bpf_pick_idle_cpu(cast_mask(tmp), 0);
-		if (cpu >= 0)
-			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		if (cd_cpumask) {
+			bpf_cpumask_and(tmp, cast_mask(active), cast_mask(cd_cpumask));
+			bpf_cpumask_and(tmp, cast_mask(tmp), prev->cpus_ptr);
+			cpu = scx_bpf_pick_idle_cpu(cast_mask(tmp), 0);
+			if (cpu < 0 && !bpf_cpumask_empty(cast_mask(tmp)))
+				cpu = bpf_cpumask_any_distribute(cast_mask(tmp));
+		}
+		if (cpu < 0 || cpu >= nr_cpu_ids) {
+			bpf_cpumask_and(tmp, cast_mask(active), prev->cpus_ptr);
+			cpu = scx_bpf_pick_idle_cpu(cast_mask(tmp), 0);
+			if (cpu < 0 && !bpf_cpumask_empty(cast_mask(tmp)))
+				cpu = bpf_cpumask_any_distribute(cast_mask(tmp));
+		}
 	}
 	bpf_rcu_read_unlock();
+	if (cpu < 0 || cpu >= nr_cpu_ids || !(tcpuc = get_cpu_ctx_id(cpu)))
+		return false;	/* nowhere active to go: it stays for now */
+
+	taskc->suggested_cpu_id = cpu;
+	taskc->cpdom_id = tcpuc->cpdom_id;
+	dsq_id = get_target_dsq_id(prev, tcpuc, taskc);
+	scx_bpf_task_set_dsq_vtime(prev, calc_when_to_run(prev, taskc));
+	scx_bpf_dsq_insert_vtime(prev, dsq_id, sys_stat.slice_wall,
+				 prev->scx.dsq_vtime, 0);
+	account_queued_load(taskc, tcpuc->cpdom_id);
+	if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
+		account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id));
+	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 	return true;
 }
 

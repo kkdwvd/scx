@@ -216,22 +216,32 @@ static __noinline int netstack_resize(struct netstack_shm *s, u32 target, u32 fl
 		if ((cpuc->netstack & NETSTACK_CPU_NEXT) || !cpuc->is_online ||
 		    !bpf_cpumask_test_cpu(cpu, cast_mask(cand)))
 			continue;
-		cpuc->netstack |= NETSTACK_CPU_NEXT;
-		resize_nr++;
-		if (is_smt_active && resize_nr < want) {
+		if (is_smt_active) {
+			/*
+			 * Whole cores only: the per-CPU DSQ is per core, so a
+			 * granted sibling would consume the other's queue. A
+			 * core whose other sibling is not a free candidate, or
+			 * that does not fit the target, is skipped.
+			 */
 			const volatile u32 *sibling = MEMBER_VPTR(cpu_sibling, [cpu]);
 			struct cpu_ctx *sibc;
 
-			if (!sibling || *sibling == cpu || *sibling >= LAVD_CPU_ID_MAX)
+			if (!sibling || *sibling >= LAVD_CPU_ID_MAX)
 				continue;
-			sibc = get_cpu_ctx_id(*sibling);
-			if (!sibc || (sibc->netstack & NETSTACK_CPU_NEXT) ||
-			    !sibc->is_online ||
-			    !bpf_cpumask_test_cpu(*sibling, cast_mask(cand)))
-				continue;
-			sibc->netstack |= NETSTACK_CPU_NEXT;
-			resize_nr++;
+			if (*sibling != cpu) {
+				sibc = get_cpu_ctx_id(*sibling);
+				if (!sibc || resize_nr + 2 > want ||
+				    !sibc->is_online ||
+				    !bpf_cpumask_test_cpu(*sibling, cast_mask(cand)))
+					continue;
+				if (!(sibc->netstack & NETSTACK_CPU_NEXT)) {
+					sibc->netstack |= NETSTACK_CPU_NEXT;
+					resize_nr++;
+				}
+			}
 		}
+		cpuc->netstack |= NETSTACK_CPU_NEXT;
+		resize_nr++;
 	}
 
 	/* Pass 3: apply the transitions and publish the grant mask. */
@@ -337,12 +347,49 @@ int netstack_tick(void)
 }
 
 /*
+ * A CPU freshly granted may hold, in its per-CPU DSQ, tasks queued there
+ * before the grant that could run elsewhere: under --per-cpu-dsq every
+ * task of the CPU, under --warm-cpu-us those waiting for it to warm up.
+ * Move them to active CPUs, each to the queue that CPU consumes; the
+ * pinned and migration-disabled tasks stay, they can run nowhere else.
+ */
+static __always_inline void netstack_drain(s32 cpu)
+{
+	struct bpf_cpumask *active = active_cpumask;
+	struct task_struct *p;
+	struct cpu_ctx *tcpuc;
+	s32 target;
+
+	if (!active)
+		return;
+	bpf_for_each(scx_dsq, p, cpu_to_dsq(cpu), 0) {
+		if (p->nr_cpus_allowed == 1 || is_migration_disabled(p))
+			continue;
+		target = bpf_cpumask_any_and_distribute(cast_mask(active), p->cpus_ptr);
+		if (target >= nr_cpu_ids)
+			continue;
+		tcpuc = get_cpu_ctx_id(target);
+		if (!tcpuc)
+			continue;
+		/*
+		 * By vtime: lavd's queues are priority queues, and a DSQ
+		 * takes either kind of insert but not both.
+		 */
+		if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
+					   use_cpdom_dsq() ? cpdom_to_dsq(tcpuc->cpdom_id) :
+							     cpu_to_dsq(target), 0))
+			scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
+	}
+}
+
+/*
  * Dispatch on a partition CPU: registered threads first, from the CPU's net
  * DSQ; then the pinned tasks that cannot run anywhere else, from the per-CPU
  * DSQ; never the shared domain queues, which would bring the application
  * back onto the CPU. A CPU freshly granted first re-enqueues what its local
- * DSQ still holds from before the grant: the kick that came with the grant
- * only preempted the running task.
+ * DSQ still holds from before the grant, since the kick that came with the
+ * grant only preempted the running task, and drains its per-CPU DSQ of the
+ * tasks that could run elsewhere.
  */
 __hidden __attribute__ ((noinline))
 void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc)
@@ -350,12 +397,13 @@ void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc)
 	if (cpuc->netstack & NETSTACK_CPU_FRESH) {
 		cpuc->netstack &= ~NETSTACK_CPU_FRESH;
 		scx_bpf_reenqueue_local_from_anywhere();
+		netstack_drain(cpu);
 	}
 
 	if (scx_bpf_dsq_move_to_local(cpu_to_net_dsq(cpu), 0))
 		return;
 
-	if (use_per_cpu_dsq() && scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu), 0))
+	if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu), 0))
 		return;
 
 	consume_prev(prev, NULL, cpuc);

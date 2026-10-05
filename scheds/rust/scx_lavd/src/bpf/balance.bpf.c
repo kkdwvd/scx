@@ -322,6 +322,12 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 				cpu = (i * 64) + j;
 				if (cpu >= nr_cpu_ids)
 					break;
+				/*
+				 * A partition CPU's queue holds its pinned tasks
+				 * and nothing a stealer could take.
+				 */
+				if (cpu_is_netstack(cpu))
+					continue;
 
 				if (no_fast_lb) {
 					load = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +

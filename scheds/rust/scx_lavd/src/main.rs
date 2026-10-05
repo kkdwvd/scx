@@ -281,9 +281,7 @@ struct Opts {
     /// Reserve a network soft partition: a dynamically sized set of CPUs
     /// that a network stack grows and shrinks through the netstack record
     /// and that other tasks stay off, with the stack's registered threads
-    /// steered onto it with priority. Cannot be used with --per-cpu-dsq or
-    /// --warm-cpu-us, whose per-CPU queues would carry other tasks onto the
-    /// partition's CPUs.
+    /// steered onto it with priority.
     #[clap(long = "netstack", action = clap::ArgAction::SetTrue)]
     netstack: bool,
 
@@ -455,10 +453,6 @@ impl Opts {
         }
 
         if self.netstack {
-            if self.per_cpu_dsq || self.warm_cpu_us > 0 {
-                info!("--netstack cannot be used with --per-cpu-dsq or --warm-cpu-us.");
-                return None;
-            }
             if self.netstack_min_cpus > 0
                 && self.netstack_max_cpus > 0
                 && self.netstack_min_cpus > self.netstack_max_cpus

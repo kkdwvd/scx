@@ -477,7 +477,8 @@ u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc, task_ctx *tas
 	 * enabled, so the slice-shrinking heuristic in preempt.bpf.c can
 	 * act on them consistently.
 	 */
-	if (per_cpu_dsq || (pinned_slice_ns && is_effectively_pinned(taskc)))
+	if (per_cpu_dsq ||
+	    ((pinned_slice_ns || netstack_enabled) && is_effectively_pinned(taskc)))
 		return cpu_to_dsq(cpuc->cpu_id);
 
 	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
