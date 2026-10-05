@@ -316,7 +316,8 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 
 		if (!taskc->netstack)
 			slice = slice_min_ns;
-		else if (cpuc->nr_foreign_pinned)
+		else if (cpuc->nr_foreign_pinned &&
+			 !(cpuc->netstack & NETSTACK_CPU_QUANTA))
 			slice = min(pinned_slice_ns ? : sys_stat.slice_wall,
 				    sys_stat.slice_wall);
 		else
@@ -1969,7 +1970,9 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 	 * own count, and only against a registered thread.
 	 */
 	if (cpuc_is_netstack(cpuc)) {
-		if (taskc->netstack && cpuc->nr_foreign_pinned)
+		/* Under the quanta the timer, not the tick, shares the CPU. */
+		if (taskc->netstack && cpuc->nr_foreign_pinned &&
+		    !(cpuc->netstack & NETSTACK_CPU_QUANTA))
 			shrink_slice_at_tick(p, cpuc, now);
 		return;
 	}

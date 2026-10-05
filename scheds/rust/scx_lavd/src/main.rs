@@ -332,6 +332,16 @@ struct Opts {
     #[clap(long = "netstack-borrow-after-ms", default_value = "500")]
     netstack_borrow_after_ms: u32,
 
+    /// Time-share a partition CPU between its registered threads and the
+    /// pinned tasks that can run nowhere else, in microsecond quanta
+    /// "NET,OTHER": the registered threads get NET microseconds of every
+    /// NET+OTHER, the pinned tasks OTHER, each side borrowing the other's
+    /// phase when its own queue is empty. Bounds a never-sleeping poller's
+    /// delay of a pinned kthread, and the kthread's share of the poller.
+    /// "0,0" disables (default); a pool may opt out per request.
+    #[clap(long = "netstack-quanta-us", default_value = "0,0")]
+    netstack_quanta_us: String,
+
     /// Directory in bpffs under which the netstack programs and record are
     /// pinned for the stack: register_thread, unregister_thread,
     /// get_capacity, request_capacity and shm.
@@ -479,6 +489,13 @@ impl Opts {
         }
 
         if self.netstack {
+            match Self::parse_quanta(&self.netstack_quanta_us) {
+                Ok((n, o)) if (n == 0) == (o == 0) => {}
+                _ => {
+                    info!("--netstack-quanta-us takes NET,OTHER microseconds, both zero or both set.");
+                    return None;
+                }
+            }
             if self.netstack_borrow
                 && (self.netstack_borrow_below_pct > self.netstack_borrow_above_pct
                     || self.netstack_borrow_above_pct > 100)
@@ -520,6 +537,16 @@ impl Opts {
         }
 
         Some(self)
+    }
+
+    fn parse_quanta(s: &str) -> Result<(u64, u64), ()> {
+        let mut it = s.split(',');
+        let n = it.next().ok_or(())?.trim().parse::<u64>().map_err(|_| ())?;
+        let o = it.next().ok_or(())?.trim().parse::<u64>().map_err(|_| ())?;
+        if it.next().is_some() {
+            return Err(());
+        }
+        Ok((n, o))
     }
 
     fn preempt_shift_range(s: &str) -> Result<u8, String> {
@@ -938,6 +965,10 @@ impl<'a> Scheduler<'a> {
         rodata.netstack_borrow_above = ((opts.netstack_borrow_above_pct as u32) << 10) / 100;
         rodata.netstack_borrow_after =
             std::cmp::max(1, opts.netstack_borrow_after_ms / 10);
+        let (quanta_net, quanta_other) =
+            Opts::parse_quanta(&opts.netstack_quanta_us).unwrap_or((0, 0));
+        rodata.netstack_quanta_net_ns = quanta_net * 1000;
+        rodata.netstack_quanta_other_ns = quanta_other * 1000;
         // Replenishment wakes dispatch through the built-in idle tracking.
         rodata.bw_kick_builtin_idle = true;
 
@@ -1135,6 +1166,7 @@ impl<'a> Scheduler<'a> {
                 let nr_active = st.nr_active;
                 let nr_net = st.nr_netstack_cpus;
                 let nr_borrow = st.nr_netstack_borrow;
+                let nr_quanta = st.nr_netstack_quanta;
                 let nr_sched = st.nr_sched;
                 let nr_preempt = st.nr_preempt;
                 let pc_pc = Self::get_pc(st.nr_perf_cri, nr_sched);
@@ -1159,6 +1191,7 @@ impl<'a> Scheduler<'a> {
                     nr_active,
                     nr_net,
                     nr_borrow,
+                    nr_quanta,
                     nr_sched,
                     nr_preempt,
                     pc_pc,

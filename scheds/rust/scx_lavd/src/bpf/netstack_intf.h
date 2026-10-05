@@ -28,7 +28,7 @@ enum {
 	NETSTACK_REQ_CANDIDATES	= 0x1,	/* grant only within the candidates mask */
 	NETSTACK_REQ_DROP	= 0x2,	/* release the CPUs of the drop mask first */
 	NETSTACK_REQ_EXCLUSIVE	= 0x4,	/* no borrowing of the pool's idle time by other tasks */
-	NETSTACK_REQ_NO_QUANTA	= 0x8,	/* reserved: no time share with pinned tasks */
+	NETSTACK_REQ_NO_QUANTA	= 0x8,	/* no time share of the pool's CPUs with pinned tasks */
 };
 
 /*
@@ -55,6 +55,7 @@ struct netstack_shm {
 	u64	nr_grows;	/* CPUs added, summed over grants */
 	u64	nr_shrinks;	/* CPUs released, summed over grants */
 	u64	nr_denied;	/* CPUs requested beyond the cap, summed */
+	u64	nr_quanta_kicks; /* phase boundaries that preempted the running task */
 	u32	nr_registered;	/* registered network threads */
 	u32	pool;		/* this record's pool */
 	u32	cpdom;		/* its compute domain; NETSTACK_POOL_GLOBAL_CPDOM for the global pool */

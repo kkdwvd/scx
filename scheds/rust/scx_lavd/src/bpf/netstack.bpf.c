@@ -63,6 +63,34 @@ const volatile bool	netstack_borrow;
 const volatile u32	netstack_borrow_below;	/* LAVD_SHIFT fixed-point */
 const volatile u32	netstack_borrow_above;
 const volatile u32	netstack_borrow_after;	/* intervals */
+/*
+ * Quanta: a partition CPU that also has pinned tasks of its own to serve
+ * alternates between its registered threads for netstack_quanta_net_ns and
+ * those tasks for netstack_quanta_other_ns, Snap's MicroQuanta, so that a
+ * poller that never sleeps costs a pinned kthread a bounded delay and the
+ * kthread costs the poller a bounded share. Zero disables.
+ */
+const volatile u64	netstack_quanta_net_ns;
+const volatile u64	netstack_quanta_other_ns;
+
+/* The quanta's per-CPU timer and phase clock. */
+struct netstack_quanta {
+	struct bpf_timer	timer;
+	u64			epoch_ns;	/* when the current cycle started */
+	u32			cpu;
+	u32			inited;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, LAVD_CPU_ID_MAX);
+	__type(key, u32);
+	__type(value, struct netstack_quanta);
+} netstack_quanta_map SEC(".maps");
+
+#ifndef BPF_F_TIMER_HARDIRQ
+#define BPF_F_TIMER_HARDIRQ (1ULL << 4)
+#endif
 
 /*
  * The granted CPUs of every pool, their union, the online CPUs outside the
@@ -393,6 +421,7 @@ int netstack_resize(u32 pool, u32 target, u32 flags)
 			cpuc->netstack_pool = 0;
 			if (!was)
 				continue;
+			/* The quanta timer, if armed, finds the CPU gone and dies. */
 			cpuc->netstack = 0;
 			cpuc->netstack_idle_ticks = 0;
 			bpf_cpumask_clear_cpu(cpu, pmask);
@@ -467,7 +496,7 @@ static __always_inline void netstack_borrow_gate(void)
 	struct bpf_cpumask *borrow = netstack_borrow_cpumask;
 	struct netstack_shm *s;
 	struct cpu_ctx *cpuc;
-	u32 cpu, nr = 0;
+	u32 cpu, nr = 0, nr_quanta = 0;
 	bool open, exclusive;
 
 	if (!borrow)
@@ -503,6 +532,8 @@ static __always_inline void netstack_borrow_gate(void)
 		} else {
 			cpuc->netstack_idle_ticks = 0;
 		}
+		if (cpuc->netstack & NETSTACK_CPU_QUANTA)
+			nr_quanta++;
 		if (open) {
 			cpuc->netstack |= NETSTACK_CPU_BORROW;
 			bpf_cpumask_set_cpu(cpu, borrow);
@@ -518,6 +549,7 @@ static __always_inline void netstack_borrow_gate(void)
 		}
 	}
 	sys_stat.nr_netstack_borrow = nr;
+	sys_stat.nr_netstack_quanta = nr_quanta;
 }
 
 /*
@@ -604,13 +636,106 @@ static __always_inline void netstack_drain(s32 cpu)
 }
 
 /*
+ * The quanta timer: at each boundary, recompute the phase from the cycle's
+ * epoch, so that a late callback does not stretch either phase, re-arm on
+ * the absolute deadline, and preempt the running task when it belongs to
+ * the phase that just ended. The timer dies, without re-arming, once the
+ * CPU has left the partition or has no pinned task of its own left to
+ * serve; the next dispatch that finds one arms it again.
+ */
+static int netstack_quanta_cb(void *map, int *key, struct netstack_quanta *q)
+{
+	struct cpu_ctx *cpuc = get_cpu_ctx_id(q->cpu);
+	struct netstack_shm *s;
+	u64 now, period, cycle, deadline;
+	bool other;
+
+	if (!cpuc)
+		return 0;
+	if (!(cpuc->netstack & NETSTACK_CPU_GRANTED) || !cpuc->nr_foreign_pinned ||
+	    q->cpu != bpf_get_smp_processor_id()) {
+		cpuc->netstack &= ~(NETSTACK_CPU_QUANTA | NETSTACK_CPU_OTHER);
+		return 0;
+	}
+
+	period = netstack_quanta_net_ns + netstack_quanta_other_ns;
+	now = bpf_ktime_get_ns();
+	if (!period || now < q->epoch_ns) {
+		cpuc->netstack &= ~(NETSTACK_CPU_QUANTA | NETSTACK_CPU_OTHER);
+		return 0;
+	}
+	cycle = (now - q->epoch_ns) % period;
+	other = cycle >= netstack_quanta_net_ns;
+	deadline = now - cycle + (other ? period : netstack_quanta_net_ns);
+	if (other)
+		cpuc->netstack |= NETSTACK_CPU_OTHER;
+	else
+		cpuc->netstack &= ~NETSTACK_CPU_OTHER;
+	if (bpf_timer_start(&q->timer, deadline, BPF_F_TIMER_ABS | BPF_F_TIMER_CPU_PIN)) {
+		cpuc->netstack &= ~(NETSTACK_CPU_QUANTA | NETSTACK_CPU_OTHER);
+		return 0;
+	}
+
+	/* The task of the phase that ended yields; the other phase's keeps the CPU. */
+	if (other == !!cpuc->netstack_curr) {
+		scx_bpf_kick_cpu(q->cpu, SCX_KICK_PREEMPT);
+		s = netstack_rec(cpuc->netstack_pool);
+		if (s)
+			s->nr_quanta_kicks++;
+	}
+	return 0;
+}
+
+/*
+ * Arm the quanta timer on this CPU when it has both a registered thread
+ * and a pinned task of its own to serve and the pool allows the time
+ * share. Called from the CPU's own dispatch: the timer is pinned to the
+ * calling CPU.
+ */
+static __always_inline void netstack_quanta_arm(s32 cpu, struct cpu_ctx *cpuc)
+{
+	struct netstack_quanta *q;
+	struct netstack_shm *s;
+	u32 key = cpu;
+	u64 now;
+
+	if (!netstack_quanta_net_ns || !netstack_quanta_other_ns ||
+	    (cpuc->netstack & NETSTACK_CPU_QUANTA) || !cpuc->nr_foreign_pinned)
+		return;
+	s = netstack_rec(cpuc->netstack_pool);
+	if (!s || (READ_ONCE(s->flags) & NETSTACK_REQ_NO_QUANTA))
+		return;
+	q = bpf_map_lookup_elem(&netstack_quanta_map, &key);
+	if (!q)
+		return;
+	if (!q->inited) {
+		if (bpf_timer_init(&q->timer, &netstack_quanta_map,
+				   CLOCK_MONOTONIC | BPF_F_TIMER_HARDIRQ))
+			return;
+		if (bpf_timer_set_callback(&q->timer, netstack_quanta_cb))
+			return;
+		q->cpu = cpu;
+		q->inited = 1;
+	}
+	now = bpf_ktime_get_ns();
+	q->epoch_ns = now;
+	cpuc->netstack &= ~NETSTACK_CPU_OTHER;	/* a cycle starts with the registered phase */
+	if (bpf_timer_start(&q->timer, now + netstack_quanta_net_ns,
+			    BPF_F_TIMER_ABS | BPF_F_TIMER_CPU_PIN))
+		return;
+	cpuc->netstack |= NETSTACK_CPU_QUANTA;
+}
+
+/*
  * Dispatch on a partition CPU: registered threads first, from the CPU's net
  * DSQ; then the pinned tasks that cannot run anywhere else, from the per-CPU
  * DSQ; never the shared domain queues, which would bring the application
- * back onto the CPU. A CPU freshly granted first re-enqueues what its local
- * DSQ still holds from before the grant, since the kick that came with the
- * grant only preempted the running task, and drains its per-CPU DSQ of the
- * tasks that could run elsewhere.
+ * back onto the CPU. In the quanta's pinned phase the two change places,
+ * each side borrowing the other's phase when its own queue is empty. A CPU
+ * freshly granted first re-enqueues what its local DSQ still holds from
+ * before the grant, since the kick that came with the grant only preempted
+ * the running task, and drains its per-CPU DSQ of the tasks that could run
+ * elsewhere.
  */
 __hidden __attribute__ ((noinline))
 void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc)
@@ -621,11 +746,19 @@ void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc)
 		netstack_drain(cpu);
 	}
 
-	if (scx_bpf_dsq_move_to_local(cpu_to_net_dsq(cpu), 0))
-		return;
+	netstack_quanta_arm(cpu, cpuc);
 
-	if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu), 0))
-		return;
+	if (cpuc->netstack & NETSTACK_CPU_OTHER) {
+		if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu), 0))
+			return;
+		if (scx_bpf_dsq_move_to_local(cpu_to_net_dsq(cpu), 0))
+			return;
+	} else {
+		if (scx_bpf_dsq_move_to_local(cpu_to_net_dsq(cpu), 0))
+			return;
+		if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu), 0))
+			return;
+	}
 
 	/*
 	 * Nothing of the partition's: with the borrowing gate open, take a
@@ -830,8 +963,8 @@ int lavd_netstack_request_capacity(struct netstack_req_arg *arg)
 		return -ENODEV;
 	if (arg->pool >= nr_pools() || !(s = netstack_rec(arg->pool)) ||
 	    (arg->flags & ~(NETSTACK_REQ_CANDIDATES | NETSTACK_REQ_DROP |
-			    NETSTACK_REQ_EXCLUSIVE)))
-		return -EINVAL;	/* the other flags are reserved */
+			    NETSTACK_REQ_EXCLUSIVE | NETSTACK_REQ_NO_QUANTA)))
+		return -EINVAL;
 	if (arg->target_cpus < -1)
 		return -EINVAL;	/* a target beyond the cap is granted the cap */
 

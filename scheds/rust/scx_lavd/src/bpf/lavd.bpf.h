@@ -67,6 +67,8 @@ enum consts_netstack {
 	NETSTACK_CPU_FRESH		= 0x2, /* granted since its last dispatch */
 	NETSTACK_CPU_NEXT		= 0x4, /* scratch of the grant being computed */
 	NETSTACK_CPU_BORROW		= 0x8, /* open to borrowing by other tasks */
+	NETSTACK_CPU_QUANTA		= 0x10, /* the quanta timer is armed */
+	NETSTACK_CPU_OTHER		= 0x20, /* in the pinned tasks' phase of the quanta */
 };
 
 /*
@@ -376,6 +378,8 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 extern const volatile bool	netstack_enabled;
 extern const volatile u64	netstack_slice_ns;
 extern const volatile bool	netstack_borrow;
+extern const volatile u64	netstack_quanta_net_ns;
+extern const volatile u64	netstack_quanta_other_ns;
 extern struct bpf_cpumask __kptr *netstack_borrow_cpumask; /* partition CPUs open to borrowing */
 extern struct bpf_cpumask __kptr *netstack_avail_cpumask; /* partition CPUs not running a registered thread */
 extern struct bpf_cpumask __kptr *netstack_cpumask;	/* the granted CPUs of every pool */
