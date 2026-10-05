@@ -281,7 +281,8 @@ struct Opts {
 
     /// Reserve a network soft partition: a dynamically sized set of CPUs
     /// that a network stack grows and shrinks through the netstack record
-    /// and that other tasks stay off. Cannot be used with --per-cpu-dsq or
+    /// and that other tasks stay off, with the stack's registered threads
+    /// steered onto it with priority. Cannot be used with --per-cpu-dsq or
     /// --warm-cpu-us, whose per-CPU queues would carry other tasks onto the
     /// partition's CPUs.
     #[clap(long = "netstack", action = clap::ArgAction::SetTrue)]
@@ -302,6 +303,11 @@ struct Opts {
     /// later.
     #[clap(long = "netstack-cpus", default_value = "")]
     netstack_cpus: String,
+
+    /// Time slice in microseconds of a registered network thread on a
+    /// partition CPU with no other pinned task waiting.
+    #[clap(long = "netstack-slice-us", default_value = "20000")]
+    netstack_slice_us: u64,
 
     /// Enable stats monitoring with the specified interval.
     #[clap(long)]
@@ -840,6 +846,7 @@ impl<'a> Scheduler<'a> {
             std::cmp::max(1, (*NR_CPU_IDS as u32) / 2)
         };
         rodata.netstack_min_cpus = opts.netstack_min_cpus;
+        rodata.netstack_slice_ns = opts.netstack_slice_us * 1000;
         // Replenishment wakes dispatch through the built-in idle tracking.
         rodata.bw_kick_builtin_idle = true;
 

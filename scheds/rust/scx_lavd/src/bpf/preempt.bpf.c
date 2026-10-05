@@ -375,7 +375,7 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 	 * An ordinary task does not preempt its way into the network
 	 * partition.
 	 */
-	if (netstack_enabled && preferred_cpu >= 0 &&
+	if (netstack_enabled && !taskc->netstack && preferred_cpu >= 0 &&
 	    cpu_is_netstack(preferred_cpu))
 		preferred_cpu = -ENOENT;
 
@@ -429,7 +429,7 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 		return;
 
 	bpf_cpumask_and(cpumask, cast_mask(cd_cpumask), p->cpus_ptr);
-	if (netstack_enabled) {
+	if (netstack_enabled && !taskc->netstack) {
 		struct bpf_cpumask *free = netstack_free_cpumask;
 
 		if (free)

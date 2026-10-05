@@ -39,6 +39,7 @@
 const volatile bool	netstack_enabled;
 const volatile u32	netstack_max_cpus;	/* the host's cap on the partition */
 const volatile u32	netstack_min_cpus;
+const volatile u64	netstack_slice_ns;	/* a registered thread's slice on a partition CPU */
 
 /*
  * The granted CPUs, their complement among the online CPUs, and the
@@ -83,6 +84,45 @@ static __always_inline bool mask_test(const u64 *mask, u32 cpu)
 	if (cpu >= NETSTACK_CPU_ID_MAX)
 		return false;
 	return mask[cpu / 64] & (1ULL << (cpu % 64));
+}
+
+/*
+ * Register or unregister @p as a network thread. Registration is a field of
+ * its own in the task context rather than a flag bit: the scheduler's flag
+ * updates are read-modify-writes under the task's rq lock, which a writer
+ * from another context would race.
+ */
+__hidden
+int netstack_register_task(struct task_struct *p, bool on)
+{
+	struct netstack_shm *s = netstack_rec();
+	task_ctx *taskc;
+
+	if (!netstack_enabled || !s)
+		return -ENODEV;
+	taskc = find_task_ctx(p);
+	if (!taskc)
+		return -ESRCH;
+	if (!!READ_ONCE(taskc->netstack) == on)
+		return 0;
+	WRITE_ONCE(taskc->netstack, on);
+	if (on)
+		__sync_fetch_and_add(&s->nr_registered, 1);
+	else
+		__sync_fetch_and_sub(&s->nr_registered, 1);
+	return 0;
+}
+
+/* A registered thread exits: it leaves the count. */
+__hidden
+void netstack_task_exit(task_ctx *taskc)
+{
+	struct netstack_shm *s = netstack_rec();
+
+	if (!taskc->netstack || !s)
+		return;
+	taskc->netstack = 0;
+	__sync_fetch_and_sub(&s->nr_registered, 1);
 }
 
 /*
@@ -297,8 +337,9 @@ int netstack_tick(void)
 }
 
 /*
- * Dispatch on a partition CPU: the pinned tasks that cannot run anywhere
- * else, from the per-CPU DSQ; never the shared domain queues, which would bring the application
+ * Dispatch on a partition CPU: registered threads first, from the CPU's net
+ * DSQ; then the pinned tasks that cannot run anywhere else, from the per-CPU
+ * DSQ; never the shared domain queues, which would bring the application
  * back onto the CPU. A CPU freshly granted first re-enqueues what its local
  * DSQ still holds from before the grant: the kick that came with the grant
  * only preempted the running task.
@@ -311,6 +352,9 @@ void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc)
 		scx_bpf_reenqueue_local_from_anywhere();
 	}
 
+	if (scx_bpf_dsq_move_to_local(cpu_to_net_dsq(cpu), 0))
+		return;
+
 	if (use_per_cpu_dsq() && scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu), 0))
 		return;
 
@@ -318,13 +362,30 @@ void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc)
 }
 
 /*
- * Start the free mask as the online CPUs.
+ * Kick the CPU a registered thread was queued on: preempt whatever runs
+ * there unless it is another registered thread, which keeps its turn.
+ */
+__hidden
+void netstack_kick(s32 cpu, struct cpu_ctx *cpuc, bool is_idle)
+{
+	if (is_idle)
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+	else if (!cpuc->netstack_curr)
+		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+}
+
+/*
+ * Create the net DSQs, one per CPU on its NUMA node, and start the free
+ * mask as the online CPUs.
  */
 __hidden
 int netstack_init(void)
 {
 	struct bpf_cpumask *free;
 	const struct cpumask *online;
+	struct cpdom_ctx *cpdomc;
+	struct cpu_ctx *cpuc;
+	int cpu, err;
 
 	if (!netstack_enabled)
 		return 0;
@@ -340,6 +401,24 @@ int netstack_init(void)
 	if (!free)
 		return -ENOMEM;
 
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		cpuc = get_cpu_ctx_id(cpu);
+		if (!cpuc) {
+			scx_bpf_error("Failed to lookup cpu_ctx: %d", cpu);
+			return -ESRCH;
+		}
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+		if (!cpdomc) {
+			scx_bpf_error("Failed to lookup cpdom_ctx for %hhu", cpuc->cpdom_id);
+			return -ESRCH;
+		}
+		err = scx_bpf_create_dsq(cpu_to_net_dsq(cpu), cpdomc->numa_id);
+		if (err) {
+			scx_bpf_error("Failed to create a net DSQ for cpu %d on NUMA node %d",
+				      cpu, cpdomc->numa_id);
+			return err;
+		}
+	}
 	last_nr_cpus_onln = nr_cpus_onln;
 	return 0;
 }

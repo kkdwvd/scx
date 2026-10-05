@@ -100,6 +100,13 @@ static u64 calc_weight_factor(struct task_struct *p, task_ctx *taskc)
 		weight_boost += LAVD_LC_WEIGHT_BOOST_MEDIUM;
 
 	/*
+	 * Prioritize a registered network thread: it serves the partition's
+	 * packets, and when two of them share a CPU, the deadline orders them.
+	 */
+	if (taskc->netstack)
+		weight_boost += LAVD_LC_WEIGHT_BOOST_HIGH;
+
+	/*
 	 * Prioritize a lock holder for faster system-wide forward progress.
 	 */
 	if (test_task_flag(taskc, LAVD_FLAG_NEED_LOCK_BOOST)) {

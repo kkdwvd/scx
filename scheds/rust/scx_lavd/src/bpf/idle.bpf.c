@@ -420,7 +420,7 @@ bool can_run_on_cpu(struct pick_ctx *ctx, s32 cpu)
 	 * CPU are tested, and the partition's threads are the wakers of the
 	 * application they serve.
 	 */
-	if (cpu_is_netstack(cpu))
+	if (!ctx->taskc->netstack && cpu_is_netstack(cpu))
 		return false;
 
 	if (!test_task_flag(ctx->taskc, LAVD_FLAG_IS_AFFINITIZED))
@@ -711,6 +711,43 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 	return cpu;
 }
 
+/*
+ * Pick a CPU for a registered network thread within the partition and its
+ * affinity. Called under the RCU read lock of pick_idle_cpu().
+ */
+static __always_inline
+s32 netstack_pick_cpu(struct pick_ctx *ctx, bool *is_idle)
+{
+	struct bpf_cpumask *net = netstack_cpumask;
+	struct bpf_cpumask *tmp = ctx->cpuc_cur->temp_mask;
+	s32 cpu;
+
+	if (!net || !tmp || bpf_cpumask_empty(cast_mask(net)))
+		return -ENOENT;
+
+	bpf_cpumask_and(tmp, cast_mask(net), ctx->p->cpus_ptr);
+	if (bpf_cpumask_empty(cast_mask(tmp)))
+		return -ENOENT;
+
+	if (bpf_cpumask_test_cpu(ctx->prev_cpu, cast_mask(tmp)) &&
+	    scx_bpf_test_and_clear_cpu_idle(ctx->prev_cpu)) {
+		*is_idle = true;
+		return ctx->prev_cpu;
+	}
+
+	cpu = scx_bpf_pick_idle_cpu(cast_mask(tmp), 0);
+	if (cpu >= 0) {
+		*is_idle = true;
+		return cpu;
+	}
+
+	if (bpf_cpumask_test_cpu(ctx->prev_cpu, cast_mask(tmp)))
+		return ctx->prev_cpu;
+
+	cpu = bpf_cpumask_any_distribute(cast_mask(tmp));
+	return cpu < nr_cpu_ids ? cpu : -ENOENT;
+}
+
 __hidden __noinline
 s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 {
@@ -793,6 +830,18 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 		goto unlock_out;
 	}
 	/* NOTE: Now task @p is not a per-CPU task. */
+
+	/*
+	 * A registered network thread runs on the partition while it has one:
+	 * its previous CPU if idle, else any idle partition CPU, else its
+	 * previous CPU if in the partition, else any partition CPU. Without a
+	 * grant it is placed like any other task.
+	 */
+	if (ctx->taskc->netstack) {
+		cpu = netstack_pick_cpu(ctx, is_idle);
+		if (cpu >= 0)
+			goto unlock_out;
+	}
 
 	/*
 	 * Warm-CPU preference: Prefer the previous CPU while its cache and TLB

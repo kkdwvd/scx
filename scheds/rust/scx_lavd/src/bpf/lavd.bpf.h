@@ -30,6 +30,7 @@
 
 #define cpdom_to_dsq(cpdom_id)		((cpdom_id) | LAVD_DSQ_TYPE_CPDOM << LAVD_DSQ_TYPE_SHFT)
 #define cpdom_to_turb_dsq(cpdom_id)	((cpdom_id) | LAVD_DSQ_TYPE_CPDOM_TURB << LAVD_DSQ_TYPE_SHFT)
+#define cpu_to_net_dsq(cpu)		((cpu) | LAVD_DSQ_TYPE_NET << LAVD_DSQ_TYPE_SHFT)
 #define dsq_to_cpdom(dsq_id)		((dsq_id) & LAVD_DSQ_ID_MASK)
 #define dsq_to_cpu(dsq_id)		((dsq_id) & LAVD_DSQ_ID_MASK)
 #define dsq_type(dsq_id)		(((dsq_id) & LAVD_DSQ_TYPE_MASK) >> LAVD_DSQ_TYPE_SHFT)
@@ -51,10 +52,11 @@ enum {
 	LAVD_DSQ_TYPE_MASK		= 0x3 << LAVD_DSQ_TYPE_SHFT,
 	LAVD_DSQ_ID_SHFT		= 0,
 	LAVD_DSQ_ID_MASK		= 0xfff << LAVD_DSQ_ID_SHFT,
-	LAVD_DSQ_NR_TYPES		= 3,
+	LAVD_DSQ_NR_TYPES		= 4,
 	LAVD_DSQ_TYPE_CPDOM		= 1,
 	LAVD_DSQ_TYPE_CPDOM_TURB		= 2,
 	LAVD_DSQ_TYPE_CPU		= 0,
+	LAVD_DSQ_TYPE_NET		= 3, /* registered network threads, per CPU */
 };
 
 /*
@@ -229,7 +231,9 @@ struct task_ctx {
 	volatile u32	cpdom_id;		/* chosen compute domain id at ops.enqueue() */
 	volatile u32	suggested_cpu_id;	/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
 	volatile s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
-	u32	__pad0;
+	u8	netstack;		/* a registered network thread; written by netstack.bpf.c only */
+	u8	netstack_cnt;		/* counted in cpu_ctx.nr_foreign_pinned at pinned_cpu_id */
+	u16	__pad0;
 	u64	last_running_clk;	/* last time when scheduled in */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
@@ -369,13 +373,16 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 
 /* The network soft partition (netstack.bpf.c). */
 extern const volatile bool	netstack_enabled;
+extern const volatile u64	netstack_slice_ns;
 extern struct bpf_cpumask __kptr *netstack_cpumask;	/* the granted CPUs */
 extern struct bpf_cpumask __kptr *netstack_free_cpumask; /* online CPUs outside the partition */
 extern struct bpf_cpumask __kptr *netstack_cand_cpumask;
 
 int netstack_init(void);
 int netstack_tick(void);
+int netstack_register_task(struct task_struct *p, bool on);
 void netstack_dispatch(s32 cpu, struct task_struct *prev, struct cpu_ctx *cpuc);
+void netstack_kick(s32 cpu, struct cpu_ctx *cpuc, bool is_idle);
 
 /*
  * CPU context
@@ -406,8 +413,9 @@ struct cpu_ctx {
 	u8		cpdom_alt_id;	/* compute domain id of alternative type */
 	u8		is_online;	/* is this CPU online? */
 	u8		netstack;	/* NETSTACK_CPU_*: in the network soft partition */
-	u8		__pad0;
+	u8		netstack_curr;	/* the running task is a registered network thread */
 	volatile s32	futex_op;	/* futex op in futex V1 */
+	volatile u32	nr_foreign_pinned; /* of nr_pinned_tasks, those not registered network threads */
 
 	/* --- cacheline 1 boundary (64 bytes): write accumulators --- */
 	/*
@@ -857,6 +865,8 @@ static __always_inline bool cpuc_is_netstack(struct cpu_ctx *cpuc)
 {
 	return netstack_enabled && (cpuc->netstack & NETSTACK_CPU_GRANTED);
 }
+
+void netstack_task_exit(task_ctx *taskc);
 
 /* Overflow-set bookkeeping helpers. */
 

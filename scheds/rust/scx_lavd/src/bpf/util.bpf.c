@@ -464,6 +464,14 @@ u64 get_target_dsq_id(struct task_struct *p, struct cpu_ctx *cpuc, task_ctx *tas
 	struct cpdom_ctx *cpdomc;
 
 	/*
+	 * A registered network thread headed for a partition CPU waits in
+	 * that CPU's net DSQ, which the CPU serves before anything else.
+	 */
+	if (taskc->netstack && cpuc_is_netstack(cpuc))
+		return cpu_to_net_dsq(cpuc->cpu_id);
+
+
+	/*
 	 * Route effectively pinned tasks (permanent pinning or
 	 * migrate_disable) to the per-CPU DSQ when pinned_slice_ns is
 	 * enabled, so the slice-shrinking heuristic in preempt.bpf.c can

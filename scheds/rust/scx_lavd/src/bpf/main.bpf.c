@@ -306,6 +306,28 @@ static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 		return LAVD_SLICE_MAX_NS_DFL;
 
 	/*
+	 * On a partition CPU a registered network thread runs a long slice,
+	 * shortened to the pinned slice only while pinned tasks that can run
+	 * nowhere else wait for the CPU; anything else there gets the shortest
+	 * slice, so that the next dispatch finds the partition's work soon.
+	 */
+	if (cpuc_is_netstack(cpuc)) {
+		u64 slice;
+
+		if (!taskc->netstack)
+			slice = slice_min_ns;
+		else if (cpuc->nr_foreign_pinned)
+			slice = min(pinned_slice_ns ? : sys_stat.slice_wall,
+				    sys_stat.slice_wall);
+		else
+			slice = netstack_slice_ns;
+		taskc->slice_wall = slice;
+		reset_task_flag(taskc, LAVD_FLAG_SLICE_BOOST);
+		return slice;
+	}
+
+
+	/*
 	 * If pinned_slice_ns is enabled and there are pinned tasks waiting
 	 * to run on this CPU, unconditionally reduce the time slice for
 	 * all tasks to ensure pinned tasks can run promptly.
@@ -671,12 +693,13 @@ static void update_stat_for_refill(struct task_struct *p,
 					   taskc->acc_runtime_invr);
 }
 
-static bool can_direct_dispatch(struct cpu_ctx *cpuc, bool is_cpu_idle)
+static bool can_direct_dispatch(struct cpu_ctx *cpuc, task_ctx *taskc, bool is_cpu_idle)
 {
 	/*
-	 * Nothing is dispatched straight onto a partition CPU.
+	 * A registered network thread goes through its CPU's net DSQ, and
+	 * nothing else is dispatched straight onto a partition CPU.
 	 */
-	if (cpuc_is_netstack(cpuc))
+	if (taskc->netstack || cpuc_is_netstack(cpuc))
 		return false;
 
 	/*
@@ -888,7 +911,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 			goto out;
 		}
 
-		if (can_direct_dispatch(cpuc, true)) {
+		if (can_direct_dispatch(cpuc, ictx.taskc, true)) {
 			/*
 			 * The direct-dispatch path bypasses ops.enqueue(), so
 			 * the throttle check there is never reached.  Skip the
@@ -995,6 +1018,10 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		dsq_id = get_target_dsq_id(p, cpuc, taskc);
 		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
 					 p->scx.dsq_vtime, enq_flags);
+		if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_NET) {
+			netstack_kick(cpu, cpuc, false);
+			return;
+		}
 		goto kick_cpu_out;
 	}
 
@@ -1085,6 +1112,13 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	if (is_effectively_pinned(taskc) && (taskc->pinned_cpu_id == -ENOENT)) {
 		taskc->pinned_cpu_id = cpu;
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
+		/*
+		 * The partition's own threads are pinned too; its CPUs yield
+		 * only to the pinned tasks that are not.
+		 */
+		taskc->netstack_cnt = !taskc->netstack;
+		if (taskc->netstack_cnt)
+			__sync_fetch_and_add(&cpuc->nr_foreign_pinned, 1);
 
 		debugln("cpu%d [%d] -- %s:%d -- %s:%d", cpuc->cpu_id,
 			cpuc->nr_pinned_tasks, p->comm, p->pid, __func__,
@@ -1099,7 +1133,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * When pinned_slice_ns is enabled, pinned tasks always use per-CPU DSQ
 	 * to enable vtime comparison across DSQs during dispatch.
 	 */
-	if (can_direct_dispatch(cpuc, is_idle)) {
+	if (can_direct_dispatch(cpuc, taskc, is_idle)) {
 		reset_task_flag(taskc, LAVD_FLAG_WARM_CPU);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
 				   enq_flags);
@@ -1119,6 +1153,15 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 					 p->scx.dsq_vtime, enq_flags);
 		if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
 			account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id));
+		/*
+		 * A registered network thread waits in the partition CPU's
+		 * net DSQ: no queued load, since nothing steals it, and no
+		 * victim search, since the CPU is its own.
+		 */
+		if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_NET) {
+			netstack_kick(cpu, cpuc, is_idle);
+			return;
+		}
 	}
 	account_queued_load(taskc, cpuc->cpdom_id);
 
@@ -1222,6 +1265,9 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
 	if (is_effectively_pinned(taskc) && (taskc->pinned_cpu_id == -ENOENT)) {
 		taskc->pinned_cpu_id = cpu;
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
+		taskc->netstack_cnt = !taskc->netstack;
+		if (taskc->netstack_cnt)
+			__sync_fetch_and_add(&cpuc->nr_foreign_pinned, 1);
 	}
 
 	/*
@@ -1229,6 +1275,10 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
 	 */
 	dsq_id = get_target_dsq_id(p, cpuc, taskc);
 	scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice, p->scx.dsq_vtime, 0);
+	if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_NET) {
+		netstack_kick(cpu, cpuc, scx_bpf_test_and_clear_cpu_idle(cpu));
+		return 0;
+	}
 	account_queued_load(taskc, cpuc->cpdom_id);
 	if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
 		account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id));
@@ -1433,7 +1483,7 @@ static bool netstack_evict(struct task_struct *prev, struct cpu_ctx *cpuc)
 	u64 dsq_id;
 	s32 cpu;
 
-	if (!taskc || is_effectively_pinned(taskc) ||
+	if (!taskc || taskc->netstack || is_effectively_pinned(taskc) ||
 	    is_migration_disabled(prev))
 		return false;
 
@@ -1492,12 +1542,13 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	/*
-	 * A CPU of the network partition serves the pinned tasks that can
-	 * run nowhere else, never the shared queues; this comes before the
-	 * shortcut below, which does not look at the masks. A task that was
-	 * running here when the CPU joined cannot just be left: a dispatch
-	 * that moves nothing keeps prev. It is handed to its domain queue
-	 * instead, which ops.dispatch() may do for prev.
+	 * A CPU of the network partition serves the partition's threads and
+	 * the pinned tasks that can run nowhere else, never the shared
+	 * queues; this comes before the shortcut below, which does not look
+	 * at the masks. A task that was running here when the CPU joined
+	 * cannot just be left: a dispatch that moves nothing keeps prev. It
+	 * is handed to its domain queue instead, which ops.dispatch() may do
+	 * for prev.
 	 */
 	if (cpuc_is_netstack(cpuc)) {
 		if (prev && (prev->scx.flags & SCX_TASK_QUEUED) &&
@@ -1779,6 +1830,7 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 
 	unaccount_queued_load(taskc);
 	unaccount_queued_load_pcpu(taskc);
+	cpuc->netstack_curr = taskc->netstack;
 
 	/*
 	 * If the sched_ext core directly dispatched a task, calculating the
@@ -1855,8 +1907,15 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 	}
 
 	/*
-	 * If there is a pinned task on this CPU, shrink its time slice.
+	 * If there is a pinned task on this CPU, shrink its time slice. On a
+	 * partition CPU only the pinned tasks that are not the partition's
+	 * own count, and only against a registered thread.
 	 */
+	if (cpuc_is_netstack(cpuc)) {
+		if (taskc->netstack && cpuc->nr_foreign_pinned)
+			shrink_slice_at_tick(p, cpuc, now);
+		return;
+	}
 	if (cpuc->nr_pinned_tasks)
 		shrink_slice_at_tick(p, cpuc, now);
 }
@@ -1922,10 +1981,13 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 
 		if (cpuc_pinned) {
 			__sync_fetch_and_sub(&cpuc_pinned->nr_pinned_tasks, 1);
+			if (taskc->netstack_cnt)
+				__sync_fetch_and_sub(&cpuc_pinned->nr_foreign_pinned, 1);
 			debugln("%d [%d] -- %s:%d -- %s:%d", cpuc_pinned->cpu_id,
 				cpuc_pinned->nr_pinned_tasks, p->comm, p->pid,
 				__func__, __LINE__);
 		}
+		taskc->netstack_cnt = 0;
 		taskc->pinned_cpu_id = -ENOENT;
 	}
 
@@ -2327,6 +2389,9 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
 	 */
 	if (enable_cpu_bw && taskc)
 		scx_cgroup_bw_cancel((u64)taskc, SCX_CGROUP_BW_CANCEL_DROP);
+
+	if (taskc)
+		netstack_task_exit(taskc);
 
 	scx_task_free_rcu(p);
 	return 0;
@@ -2852,7 +2917,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 	}
 
 	/*
-	 * Initialize the network soft partition.
+	 * Initialize the network soft partition: its net DSQs and masks.
 	 */
 	err = netstack_init();
 	if (err)
