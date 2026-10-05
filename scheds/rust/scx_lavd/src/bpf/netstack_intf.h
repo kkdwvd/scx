@@ -49,4 +49,45 @@ struct netstack_shm {
 	u32	__pad;
 };
 
+/*
+ * Arguments of the syscall programs, run with BPF_PROG_TEST_RUN on the
+ * programs lavd pins under its netstack directory: register_thread,
+ * unregister_thread, get_capacity, request_capacity.
+ */
+
+/* lavd_netstack_register_thread(), lavd_netstack_unregister_thread() */
+struct netstack_thread_arg {
+	s32	tid;		/* the thread, or 0 for the calling thread */
+	u32	flags;		/* reserved: 0 */
+};
+
+/* lavd_netstack_get_capacity(): the grant in force, returns nr_granted */
+struct netstack_cap_arg {
+	u32	domain;		/* reserved: 0 */
+	u32	nr_granted;
+	u32	target;		/* the request the grant answers */
+	u32	cap;
+	u64	req_seq;
+	u64	grant_seq;
+	u64	granted[NETSTACK_MASK_WORDS];
+};
+
+/*
+ * lavd_netstack_request_capacity(): set the target, and the candidates and
+ * drop masks when their flags are set; returns the nr_granted in force when
+ * the call returned, which is the previous grant. The request takes effect
+ * on lavd's next tick; a grant whose applied_seq is at least req_seq
+ * answers it. Two requesters racing get -EBUSY for the second.
+ */
+struct netstack_req_arg {
+	u32	domain;		/* reserved: 0 */
+	s32	target_cpus;	/* CPUs wanted in all, capped by lavd; -1 keeps the current target */
+	u32	flags;		/* NETSTACK_REQ_* */
+	u32	nr_granted;	/* out */
+	u64	req_seq;	/* out */
+	u64	candidates[NETSTACK_MASK_WORDS];
+	u64	drop[NETSTACK_MASK_WORDS];
+	u64	granted[NETSTACK_MASK_WORDS];	/* out */
+};
+
 #endif /* __NETSTACK_INTF_H */

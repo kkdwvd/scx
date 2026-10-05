@@ -37,7 +37,6 @@ use crossbeam::channel::RecvTimeoutError;
 use crossbeam::channel::Sender;
 use crossbeam::channel::TrySendError;
 use libbpf_rs::AsRawLibbpf;
-use libbpf_rs::MapCore;
 use libbpf_rs::OpenObject;
 use libbpf_rs::PrintLevel;
 use libbpf_rs::ProgramInput;
@@ -309,6 +308,12 @@ struct Opts {
     #[clap(long = "netstack-slice-us", default_value = "20000")]
     netstack_slice_us: u64,
 
+    /// Directory in bpffs under which the netstack programs and record are
+    /// pinned for the stack: register_thread, unregister_thread,
+    /// get_capacity, request_capacity and shm.
+    #[clap(long = "netstack-pin-dir", default_value = "/sys/fs/bpf/scx_lavd/netstack")]
+    netstack_pin_dir: String,
+
     /// Enable stats monitoring with the specified interval.
     #[clap(long)]
     stats: Option<f64>,
@@ -537,6 +542,7 @@ struct Scheduler<'a> {
     _arenalib: ArenaLib,
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
+    netstack_pin_dir: Option<String>,
     intrspc: introspec,
     monitor_tid: Option<ThreadId>,
     stats_server: StatsServer<StatsReq, StatsRes>,
@@ -613,9 +619,14 @@ impl<'a> Scheduler<'a> {
         let task_size = std::mem::size_of::<types::task_ctx>();
         let arenalib = ArenaLib::setup(skel.object_mut(), task_size, 0, *NR_CPU_IDS)?;
 
-        // The initial partition, requested on the stack's behalf.
-        if opts.netstack && !opts.netstack_cpus.is_empty() {
-            Self::request_netstack_cpus(&mut skel, &opts.netstack_cpus)?;
+        // The netstack programs and record for the stack, and the initial
+        // partition, requested on the stack's behalf through the same
+        // program a stack would use.
+        if opts.netstack {
+            Self::pin_netstack(&mut skel, &opts.netstack_pin_dir)?;
+            if !opts.netstack_cpus.is_empty() {
+                Self::request_netstack_cpus(&mut skel, &opts.netstack_cpus)?;
+            }
         }
 
         // Attach.
@@ -626,6 +637,7 @@ impl<'a> Scheduler<'a> {
             _arenalib: arenalib,
             skel,
             struct_ops,
+            netstack_pin_dir: opts.netstack.then(|| opts.netstack_pin_dir.clone()),
             intrspc: introspec::new(),
             monitor_tid: None,
             stats_server,
@@ -778,29 +790,76 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Write the request for @cpulist into the netstack record, as the
-    /// stack would: its CPUs as the candidates and its size as the target.
+    const NETSTACK_PINS: [&'static str; 5] = [
+        "register_thread",
+        "unregister_thread",
+        "get_capacity",
+        "request_capacity",
+        "shm",
+    ];
+
+    /// Pin the netstack programs and record under @dir, replacing what a
+    /// previous instance left behind.
+    fn pin_netstack(skel: &mut BpfSkel, dir: &str) -> Result<()> {
+        let dir = std::path::Path::new(dir);
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create {}", dir.display()))?;
+        for name in Self::NETSTACK_PINS {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        skel.progs
+            .lavd_netstack_register_thread
+            .pin(dir.join("register_thread"))?;
+        skel.progs
+            .lavd_netstack_unregister_thread
+            .pin(dir.join("unregister_thread"))?;
+        skel.progs
+            .lavd_netstack_get_capacity
+            .pin(dir.join("get_capacity"))?;
+        skel.progs
+            .lavd_netstack_request_capacity
+            .pin(dir.join("request_capacity"))?;
+        skel.maps.netstack_shm.pin(dir.join("shm"))?;
+        info!("Netstack programs pinned under {}.", dir.display());
+        Ok(())
+    }
+
+    fn unpin_netstack(dir: &str) {
+        let dir = std::path::Path::new(dir);
+        for name in Self::NETSTACK_PINS {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    /// Request @cpulist for the partition as the stack would: its CPUs as
+    /// the candidates and its size as the target.
     fn request_netstack_cpus(skel: &mut BpfSkel, cpulist: &str) -> Result<()> {
         let mask = Cpumask::from_cpulist(cpulist)?;
-        let mut rec: netstack_shm = unsafe { mem::MaybeUninit::zeroed().assume_init() };
+        let mut arg: netstack_req_arg = unsafe { mem::MaybeUninit::zeroed().assume_init() };
 
         for cpu in mask.iter() {
-            rec.candidates[cpu / 64] |= 1u64 << (cpu % 64);
+            arg.candidates[cpu / 64] |= 1u64 << (cpu % 64);
         }
-        rec.target = mask.weight() as u32;
-        rec.flags = NETSTACK_REQ_CANDIDATES;
-        rec.req_seq = 2;
+        arg.target_cpus = mask.weight() as i32;
+        arg.flags = NETSTACK_REQ_CANDIDATES;
 
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &rec as *const netstack_shm as *const u8,
-                mem::size_of::<netstack_shm>(),
-            )
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut arg as *mut netstack_req_arg as *mut u8,
+                    mem::size_of::<netstack_req_arg>(),
+                )
+            }),
+            ..Default::default()
         };
-        skel.maps
-            .netstack_shm
-            .update(&0u32.to_ne_bytes(), bytes, libbpf_rs::MapFlags::ANY)
-            .context("Failed to write the initial netstack request")?;
+        let out = skel.progs.lavd_netstack_request_capacity.test_run(input)?;
+        if (out.return_value as i32) < 0 {
+            anyhow::bail!(
+                "The initial netstack request failed: {}",
+                out.return_value as i32
+            );
+        }
         info!("Network partition requested for CPUs {cpulist}.");
         Ok(())
     }
@@ -1204,6 +1263,9 @@ impl Drop for Scheduler<'_> {
 
         if let Some(struct_ops) = self.struct_ops.take() {
             drop(struct_ops);
+        }
+        if let Some(dir) = self.netstack_pin_dir.take() {
+            Self::unpin_netstack(&dir);
         }
     }
 }

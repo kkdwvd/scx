@@ -423,3 +423,140 @@ int netstack_init(void)
 	return 0;
 }
 
+/*
+ * The syscall programs: the stack's side of the record, run with
+ * BPF_PROG_TEST_RUN on the programs pinned under lavd's netstack directory.
+ * They are sleepable and run in the caller's context, so every use of a
+ * task context is inside an RCU read-side section.
+ */
+
+/* Copy the grant in force into @nr, @seq, @req and @mask, under its seqlock. */
+static __always_inline int netstack_read_grant(struct netstack_shm *s, u32 *nr,
+					       u32 *target, u32 *cap, u64 *seq,
+					       u64 *applied, u64 *mask)
+{
+	u64 s1, s2;
+	int i, words = (nr_cpu_ids + 63) / 64, tries = 0;
+
+	do {
+		s1 = __sync_fetch_and_add(&s->grant_seq, 0);
+		if (s1 & 1)
+			continue;
+		*nr = READ_ONCE(s->nr_granted);
+		*target = READ_ONCE(s->target);
+		*cap = READ_ONCE(s->cap);
+		*applied = READ_ONCE(s->applied_seq);
+		bpf_for(i, 0, words) {
+			if (i >= NETSTACK_MASK_WORDS)
+				break;
+			mask[i] = READ_ONCE(s->granted[i]);
+		}
+		s2 = __sync_fetch_and_add(&s->grant_seq, 0);
+		if (s1 == s2) {
+			*seq = s1;
+			return 0;
+		}
+	} while (++tries < 64 && can_loop);
+	return -EAGAIN;
+}
+
+static __always_inline struct task_struct *netstack_arg_task(s32 tid)
+{
+	if (tid)
+		return bpf_task_from_pid(tid);
+	return bpf_task_acquire(bpf_get_current_task_btf());
+}
+
+static int netstack_set_thread(struct netstack_thread_arg *arg, bool on)
+{
+	struct task_struct *p;
+	int err;
+
+	if (!netstack_enabled)
+		return -ENODEV;
+	if (arg->flags)
+		return -EINVAL;
+	p = netstack_arg_task(arg->tid);
+	if (!p)
+		return -ESRCH;
+	bpf_rcu_read_lock();
+	err = netstack_register_task(p, on);
+	bpf_rcu_read_unlock();
+	bpf_task_release(p);
+	return err;
+}
+
+SEC("syscall")
+int lavd_netstack_register_thread(struct netstack_thread_arg *arg)
+{
+	return netstack_set_thread(arg, true);
+}
+
+SEC("syscall")
+int lavd_netstack_unregister_thread(struct netstack_thread_arg *arg)
+{
+	return netstack_set_thread(arg, false);
+}
+
+SEC("syscall")
+int lavd_netstack_get_capacity(struct netstack_cap_arg *arg)
+{
+	struct netstack_shm *s = netstack_rec();
+	int err;
+
+	if (!netstack_enabled || !s)
+		return -ENODEV;
+	if (arg->domain)
+		return -EINVAL;
+	err = netstack_read_grant(s, &arg->nr_granted, &arg->target, &arg->cap,
+				  &arg->grant_seq, &arg->req_seq, arg->granted);
+	if (err)
+		return err;
+	return arg->nr_granted;
+}
+
+SEC("syscall")
+int lavd_netstack_request_capacity(struct netstack_req_arg *arg)
+{
+	struct netstack_shm *s = netstack_rec();
+	u64 seq;
+	u32 cap, target;
+	int i, err, words = (nr_cpu_ids + 63) / 64;
+
+	if (!netstack_enabled || !s)
+		return -ENODEV;
+	if (arg->domain ||
+	    (arg->flags & ~(NETSTACK_REQ_CANDIDATES | NETSTACK_REQ_DROP)))
+		return -EINVAL;	/* the other flags are reserved */
+	if (arg->target_cpus < -1)
+		return -EINVAL;	/* a target beyond the cap is granted the cap */
+
+	/*
+	 * Take the record's seqlock: even to odd, and only from the value
+	 * read, so that a second requester fails instead of tearing the
+	 * first's write.
+	 */
+	seq = __sync_fetch_and_add(&s->req_seq, 0);
+	if ((seq & 1) || __sync_val_compare_and_swap(&s->req_seq, seq, seq + 1) != seq)
+		return -EBUSY;
+	if (arg->target_cpus >= 0)
+		WRITE_ONCE(s->target, arg->target_cpus);
+	WRITE_ONCE(s->flags, arg->flags);
+	bpf_for(i, 0, words) {
+		if (i >= NETSTACK_MASK_WORDS)
+			break;
+		if (arg->flags & NETSTACK_REQ_CANDIDATES)
+			WRITE_ONCE(s->candidates[i], arg->candidates[i]);
+		if (arg->flags & NETSTACK_REQ_DROP)
+			WRITE_ONCE(s->drop[i], arg->drop[i]);
+	}
+	__sync_fetch_and_add(&s->req_seq, 1);
+	arg->req_seq = seq + 2;
+
+	/* The grant in force now: the one the next tick replaces. */
+	err = netstack_read_grant(s, &arg->nr_granted, &target, &cap, &seq, &seq,
+				  arg->granted);
+	if (err)
+		return err;
+	return arg->nr_granted;
+}
