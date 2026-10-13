@@ -1,0 +1,12 @@
+{
+  "repository": "sched-ext/scx",
+  "pr": 3817,
+  "base": "fead94e15184e957469b346b129f412641691bbe",
+  "unfixed_tip": "a364640c450361fa97eaafe29853a1351ca75cd0",
+  "fixed_tip": "eec93a88e6129634d21b61e032710302ea8c7328",
+  "source_path": "scheds/rust/scx_mitosis/src/bpf/mitosis.bpf.c",
+  "unfixed_source_sha256": "5267eab95d1ee867f93e4011920bfbc71f73221c1c76475a36439b91c87a1bab",
+  "fixed_source_sha256": "d4f49d2a4499090c0a4a07c6bd8f801c974e04c436d8f52d027e5c8a76fac9bd",
+  "compiler": "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+  "result": "12 regressions fail before, all 14 cases pass after; 2 controls pass both"
+}

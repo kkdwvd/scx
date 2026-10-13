@@ -1,0 +1,118 @@
+{
+  "unfixed": {
+    "remote-context": {
+      "passed": false,
+      "expected_result": true
+    },
+    "remote-clock": {
+      "passed": false,
+      "expected_result": true
+    },
+    "remote-subcell": {
+      "passed": false,
+      "expected_result": true
+    },
+    "queued-clock": {
+      "passed": false,
+      "expected_result": true
+    },
+    "sleep-clock": {
+      "passed": false,
+      "expected_result": true
+    },
+    "error-running-cell": {
+      "passed": false,
+      "expected_result": true
+    },
+    "error-running-pack": {
+      "passed": false,
+      "expected_result": true
+    },
+    "error-running-map": {
+      "passed": false,
+      "expected_result": true
+    },
+    "error-stopping-map": {
+      "passed": false,
+      "expected_result": true
+    },
+    "error-quiescent-pack": {
+      "passed": false,
+      "expected_result": true
+    },
+    "error-quiescent-map": {
+      "passed": false,
+      "expected_result": true
+    },
+    "error-running-queued": {
+      "passed": false,
+      "expected_result": true
+    },
+    "no-wait": {
+      "passed": true,
+      "expected_result": true
+    },
+    "shared-accounting": {
+      "passed": true,
+      "expected_result": true
+    }
+  },
+  "fixed": {
+    "remote-context": {
+      "passed": true,
+      "expected_result": true
+    },
+    "remote-clock": {
+      "passed": true,
+      "expected_result": true
+    },
+    "remote-subcell": {
+      "passed": true,
+      "expected_result": true
+    },
+    "queued-clock": {
+      "passed": true,
+      "expected_result": true
+    },
+    "sleep-clock": {
+      "passed": true,
+      "expected_result": true
+    },
+    "error-running-cell": {
+      "passed": true,
+      "expected_result": true
+    },
+    "error-running-pack": {
+      "passed": true,
+      "expected_result": true
+    },
+    "error-running-map": {
+      "passed": true,
+      "expected_result": true
+    },
+    "error-stopping-map": {
+      "passed": true,
+      "expected_result": true
+    },
+    "error-quiescent-pack": {
+      "passed": true,
+      "expected_result": true
+    },
+    "error-quiescent-map": {
+      "passed": true,
+      "expected_result": true
+    },
+    "error-running-queued": {
+      "passed": true,
+      "expected_result": true
+    },
+    "no-wait": {
+      "passed": true,
+      "expected_result": true
+    },
+    "shared-accounting": {
+      "passed": true,
+      "expected_result": true
+    }
+  }
+}
