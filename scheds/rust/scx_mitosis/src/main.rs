@@ -62,6 +62,9 @@ use stats::CellMetrics;
 use stats::Metrics;
 use topology::MitosisTopology;
 
+/// [tmp] canary: cell configuration compiled into the binary (see config.json).
+const TMP_EMBEDDED_CELL_CONFIG: &str = include_str!("../config.json");
+
 const SCHEDULER_NAME: &str = "scx_mitosis";
 const MAX_CELLS: usize = bpf_intf::consts_MAX_CELLS as usize;
 const MAX_SUBCELLS_PER_CELL: usize = bpf_intf::consts_MAX_SUBCELLS_PER_CELL as usize;
@@ -426,13 +429,24 @@ impl<'a> Scheduler<'a> {
         if opts.cell_parent_cgroup.is_some() && opts.cell_config.is_some() {
             bail!("--cell-parent-cgroup and --cell-config are mutually exclusive");
         }
-        if opts.cell_parent_cgroup.is_none() && opts.cell_config.is_none() {
-            bail!("either --cell-parent-cgroup or --cell-config is required");
-        }
-        if !opts.cell_exclude.is_empty() && opts.cell_parent_cgroup.is_none() {
-            bail!("--cell-exclude requires --cell-parent-cgroup");
-        }
+        // [tmp] canary: without --cell-config the embedded cell config is used,
+        // and the --cell-parent-cgroup / --cell-exclude arguments atropos passes
+        // are ignored rather than rejected.
         Ok(())
+    }
+
+    /// [tmp] canary: write the embedded cell config next to the runtime
+    /// directory so the configured-cells loader can read it. Atropos runs the
+    /// scheduler inside its own mount namespace, so a file placed on the host
+    /// would not be visible; the config travels inside the binary instead.
+    fn embedded_cell_config() -> Result<PathBuf> {
+        let path = std::env::temp_dir().join(format!(
+            "scx_mitosis_embedded_cell_config.{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, TMP_EMBEDDED_CELL_CONFIG)
+            .with_context(|| format!("writing embedded cell config to {}", path.display()))?;
+        Ok(path)
     }
 
     fn init(opts: &Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
@@ -513,34 +527,47 @@ impl<'a> Scheduler<'a> {
             .context("launching stats server")?;
 
         let cpu_to_llc: HashMap<usize, usize> = mitosis_topology.cpu_to_llc.into_iter().collect();
-        let cell_source = if let Some(ref parent_cgroup) = opts.cell_parent_cgroup {
-            let exclude: HashSet<String> = opts.cell_exclude.iter().cloned().collect();
-            CellSource::Parent(
-                CellManager::new(
-                    parent_cgroup,
-                    MAX_CELLS as u32,
-                    topology.span.clone(),
-                    exclude,
-                    opts.cell0_min_cpus,
-                    cpu_to_llc.clone(),
-                )
-                .with_context(|| {
-                    format!("initializing cell manager for cgroup {}", parent_cgroup)
-                })?,
-            )
-        } else if let Some(ref cell_config) = opts.cell_config {
-            CellSource::Configured(
-                ConfiguredCells::load(cell_config, MAX_CELLS as u32, topology.span.clone())
-                    .with_context(|| {
-                        format!(
-                            "initializing configured cells from {}",
-                            cell_config.display()
-                        )
-                    })?,
-            )
+        let embedded_cell_config = if opts.cell_config.is_none() {
+            if opts.cell_parent_cgroup.is_some() || !opts.cell_exclude.is_empty() {
+                warn!(
+                    "[tmp] ignoring --cell-parent-cgroup/--cell-exclude; using the embedded cell config"
+                );
+            }
+            Some(Self::embedded_cell_config()?)
         } else {
-            bail!("either --cell-parent-cgroup or --cell-config is required");
+            None
         };
+        let cell_config_path: Option<&PathBuf> =
+            opts.cell_config.as_ref().or(embedded_cell_config.as_ref());
+        let cell_source =
+            if let (None, Some(parent_cgroup)) = (cell_config_path, &opts.cell_parent_cgroup) {
+                let exclude: HashSet<String> = opts.cell_exclude.iter().cloned().collect();
+                CellSource::Parent(
+                    CellManager::new(
+                        parent_cgroup,
+                        MAX_CELLS as u32,
+                        topology.span.clone(),
+                        exclude,
+                        opts.cell0_min_cpus,
+                        cpu_to_llc.clone(),
+                    )
+                    .with_context(|| {
+                        format!("initializing cell manager for cgroup {}", parent_cgroup)
+                    })?,
+                )
+            } else if let Some(cell_config) = cell_config_path {
+                CellSource::Configured(
+                    ConfiguredCells::load(cell_config, MAX_CELLS as u32, topology.span.clone())
+                        .with_context(|| {
+                            format!(
+                                "initializing configured cells from {}",
+                                cell_config.display()
+                            )
+                        })?,
+                )
+            } else {
+                bail!("either --cell-parent-cgroup or --cell-config is required");
+            };
 
         // Create epoll instance for event-driven main loop
         let epoll = Epoll::new(EpollCreateFlags::empty()).context("creating epoll instance")?;

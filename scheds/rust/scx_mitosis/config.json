@@ -1,0 +1,36 @@
+[
+  {
+    "name": "allotment",
+    "matches": {
+      "CgroupRegex": "workload-tw-[^/]+\\.allotment\\.slice"
+    },
+    "subcells": [
+      {
+        "name": "hhvmworker",
+        "matches": [
+          [
+            {
+              "CommPrefix": "hhvmworker"
+            }
+          ]
+        ]
+      },
+      {
+        "name": "rest",
+        "matches": [
+          []
+        ]
+      }
+    ]
+  },
+  {
+    "name": "workload.slice",
+    "matches": {
+      "CgroupContains": "workload.slice"
+    }
+  },
+  {
+    "name": "rest",
+    "matches": {}
+  }
+]
