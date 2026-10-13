@@ -176,6 +176,13 @@ struct {
 	__uint(max_entries, MAX_CELLS * MAX_SUBCELLS_PER_CELL);
 } subcell_accounts SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct subcell_util_ring);
+	__uint(max_entries, MAX_CELLS * MAX_SUBCELLS_PER_CELL);
+} subcell_util_rings SEC(".maps");
+
 static inline struct cpu_ctx *lookup_cpu_ctx(int cpu)
 {
 	struct cpu_ctx *cctx;
@@ -1101,11 +1108,94 @@ static __always_inline void update_task_demand(struct task_ctx *tctx, struct sub
 	tctx->window_sleep_ns = 0;
 }
 
+#define UTIL_TAG_MASK ((1ULL << (64 - UTIL_TAG_SHIFT)) - 1)
+#define UTIL_PUBLISH_RETRIES 8
+
+/*
+ * Add @running_ns to window @win of @ring. The first charge to arrive for a
+ * window takes its slot over from the older window held there; a charge for
+ * a window older than the slot's is dropped, its window having been lapped.
+ * Tag and value share one word, so the takeover and the add are a single
+ * compare-and-swap. The value cannot carry into the tag: a window holds at
+ * most UTIL_WINDOW_NS per CPU.
+ */
+static __always_inline void publish_util_window(struct subcell_util_ring *ring, u32 win, u32 running_ns)
+{
+	u64 *slot = &ring->windows[win & (NR_UTIL_WINDOWS - 1)];
+	u64 tag = win & UTIL_TAG_MASK;
+	u64 old, new, seen;
+	int i;
+
+	old = READ_ONCE(*slot);
+	bpf_for(i, 0, UTIL_PUBLISH_RETRIES)
+	{
+		s16 ahead = (s16)(tag - (old >> UTIL_TAG_SHIFT));
+
+		if (ahead < 0)
+			return;
+		new = ahead ? (tag << UTIL_TAG_SHIFT) | running_ns : old + running_ns;
+		seen = __sync_val_compare_and_swap(slot, old, new);
+		if (seen == old)
+			return;
+		old = seen;
+	}
+}
+
+/*
+ * Make @win the CPU's open utilization window for the subcell, publishing
+ * the window open before it.
+ */
+static __always_inline void open_util_window(struct subcell_account *account, struct subcell_util_ring *ring, u32 win)
+{
+	if (account->util_win == win)
+		return;
+	if (account->util_win_ns)
+		publish_util_window(ring, account->util_win, account->util_win_ns);
+	account->util_win = win;
+	account->util_win_ns = 0;
+}
+
+/*
+ * Attribute @used ns of running time that ends now to the subcell's
+ * utilization windows: fixed intervals of UTIL_WINDOW_NS on CLOCK_MONOTONIC,
+ * so that userspace can tell from its own clock which windows are complete.
+ * A charge that crosses the window boundary is split there, so the
+ * attribution is exact however late the charge arrives. The tick charges a
+ * running task every tick, so a charge reaches back into the previous window
+ * at most; a longer gap only happens on a nohz_full CPU, and what lies before
+ * the previous window is dropped. The CPU accumulates into one open window
+ * per subcell and publishes it to the shared ring once a later window opens.
+ */
+static __always_inline void account_util_windows(struct subcell_account *account, u32 key, u64 used)
+{
+	struct subcell_util_ring *ring;
+	u64 now, start, from;
+	u32 win;
+
+	ring = bpf_map_lookup_elem(&subcell_util_rings, &key);
+	if (!ring)
+		return;
+	now = bpf_ktime_get_ns();
+	start = now - now % UTIL_WINDOW_NS;
+	win = now / UTIL_WINDOW_NS;
+	from = now - used;
+	if (start >= UTIL_WINDOW_NS && from < start - UTIL_WINDOW_NS)
+		from = start - UTIL_WINDOW_NS;
+	if (from < start) {
+		open_util_window(account, ring, win - 1);
+		account->util_win_ns += start - from;
+		from = start;
+	}
+	open_util_window(account, ring, win);
+	account->util_win_ns += now - from;
+}
+
 /*
  * Charge the running time of the task described by @tctx since it was last
- * accounted to its cell and subcell demand counters on the current CPU.
+ * accounted to its cell and subcell counters on the current CPU, and to the
+ * subcell's utilization windows. Returns the subcell account, or NULL.
  */
-static __always_inline void account_task_running(struct cpu_ctx *cctx, struct task_ctx *tctx, u64 now, bool stopping)
+static __always_inline struct subcell_account *charge_task_running(struct cpu_ctx *cctx, struct task_ctx *tctx, u64 now)
 {
 	u64 *running = MEMBER_VPTR(cctx->running_ns, [tctx->cell]);
 	struct subcell_account *account;
@@ -1115,23 +1205,36 @@ static __always_inline void account_task_running(struct cpu_ctx *cctx, struct ta
 
 	if (!running) {
 		scx_bpf_error("Task cell index too large: %d", tctx->cell);
-		return;
+		return NULL;
 	}
 	packed = pack_subcell_id(tctx->cell, tctx->subcell);
 	if (packed < 0)
-		return;
+		return NULL;
 	key = packed;
 	account = bpf_map_lookup_elem(&subcell_accounts, &key);
 	if (!account) {
 		scx_bpf_error("Task cell or subcell index too large: %d, %d", tctx->cell, tctx->subcell);
-		return;
+		return NULL;
 	}
 	used = time_delta(now, tctx->running_accounted_at);
 	tctx->running_accounted_at = now;
 	*running += used;
 	account->running_ns += used;
 	tctx->window_run_ns += used;
-	update_task_demand(tctx, account, now, stopping);
+	account_util_windows(account, key, used);
+	return account;
+}
+
+/*
+ * Charge the running time of the task described by @tctx since it was last
+ * accounted to its cell and subcell demand counters on the current CPU.
+ */
+static __always_inline void account_task_running(struct cpu_ctx *cctx, struct task_ctx *tctx, u64 now, bool stopping)
+{
+	struct subcell_account *account = charge_task_running(cctx, tctx, now);
+
+	if (account)
+		update_task_demand(tctx, account, now, stopping);
 }
 
 void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
@@ -1484,6 +1587,24 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 
 	/* A preempted task is still runnable; its next wait starts now. */
 	tctx->runnable_at = runnable ? now : 0;
+}
+
+/*
+ * Charge the running task once per tick, so its running time reaches the
+ * utilization windows at tick granularity rather than at its next stop or
+ * slice extension. The demand estimate is left alone: its windows span whole
+ * sleep, wait and run cycles and close in stopping().
+ */
+void BPF_STRUCT_OPS(mitosis_tick, struct task_struct *p)
+{
+	struct cpu_ctx *cctx;
+	struct task_ctx *tctx;
+
+	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)))
+		return;
+	if (!tctx->running_accounted_at)
+		return;
+	charge_task_running(cctx, tctx, scx_bpf_now());
 }
 
 SEC("fentry/cpuset_write_resmask")
@@ -2492,6 +2613,7 @@ SCX_OPS_DEFINE(mitosis,
 	       .runnable		= (void *)mitosis_runnable,
 	       .running			= (void *)mitosis_running,
 	       .stopping		= (void *)mitosis_stopping,
+	       .tick			= (void *)mitosis_tick,
 	       .quiescent		= (void *)mitosis_quiescent,
 	       .set_cpumask		= (void *)mitosis_set_cpumask,
 	       .init_task		= (void *)mitosis_init_task,

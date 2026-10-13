@@ -24,6 +24,15 @@ enum consts {
 	MAX_SUBCELL_MATCH_ANDS = 4,
 	/* Fixed-point scale of a task's demand: 1.0 == 1 << DEMAND_SHIFT. */
 	DEMAND_SHIFT = 10,
+	/*
+	 * Running time is attributed to fixed windows of UTIL_WINDOW_NS on
+	 * CLOCK_MONOTONIC and kept for the last NR_UTIL_WINDOWS of them, a
+	 * power of two so a window index maps to its slot by masking.
+	 */
+	UTIL_WINDOW_NS = 100000000, /* 100ms */
+	NR_UTIL_WINDOWS = 32,
+	/* A ring slot holds the window's low 16 index bits above its value. */
+	UTIL_TAG_SHIFT = 48,
 	USAGE_HALF_LIFE = 100000000, /* 100ms */
 
 	MAX_CG_DEPTH = 256,
@@ -120,6 +129,23 @@ struct subcell_account {
 	 * in (1 << DEMAND_SHIFT) * ns. Wraps; consumers must use deltas.
 	 */
 	u64 demand_sum;
+	/*
+	 * The utilization window open on this CPU: its index and the running
+	 * time charged to it so far. It is published to the subcell's ring
+	 * when a charge crosses into a later window.
+	 */
+	u32 util_win;
+	u32 util_win_ns;
+};
+
+/*
+ * The last NR_UTIL_WINDOWS utilization windows of one subcell, summed across
+ * CPUs. A slot holds the low 16 bits of its window's index above the running
+ * time in ns, so a reused slot is told apart from the window it held before
+ * and the takeover and the add are one compare-and-swap.
+ */
+struct subcell_util_ring {
+	u64 windows[NR_UTIL_WINDOWS];
 };
 
 /* Serialized subcell config shared between userspace and BPF. */

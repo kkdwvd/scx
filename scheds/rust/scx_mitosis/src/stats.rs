@@ -48,6 +48,10 @@ pub struct SubcellMetrics {
     pub demand: f64,
     #[stat(desc = "EWMA-smoothed demand")]
     pub smoothed_demand: f64,
+    #[stat(desc = "Quantile of CPU usage over the last 3 s of 100 ms windows, in CPUs")]
+    pub util_quantile: f64,
+    #[stat(desc = "CPUs the subcell is sized for: max(smoothed demand, usage quantile)")]
+    pub need: f64,
 }
 
 impl SubcellMetrics {

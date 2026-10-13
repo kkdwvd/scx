@@ -69,6 +69,77 @@ const NR_CSTATS: usize = bpf_intf::cell_stat_idx_NR_CSTATS as usize;
 const SHARE_SIBLING_SUBCELL_CPUS: bool = true;
 /// Fixed-point 1.0 of the per-task demand accumulated by BPF.
 const DEMAND_ONE: f64 = (1u64 << bpf_intf::consts_DEMAND_SHIFT) as f64;
+/// Length of one utilization window kept by BPF, in ns.
+const UTIL_WINDOW_NS: u64 = bpf_intf::consts_UTIL_WINDOW_NS as u64;
+/// Utilization windows kept per subcell by BPF.
+const NR_UTIL_WINDOWS: usize = bpf_intf::consts_NR_UTIL_WINDOWS as usize;
+/// A ring slot holds its window's low index bits above the running time.
+const UTIL_TAG_SHIFT: u32 = bpf_intf::consts_UTIL_TAG_SHIFT as u32;
+
+/// Running time of one subcell in each complete utilization window, oldest
+/// first. `ring` is the subcell's shared ring and `open` the window still
+/// open on each CPU with the time charged to it. A window is complete once a
+/// full window has passed since it ended, which leaves charges still in
+/// flight on a CPU time to land; a window nobody charged is idle and reads
+/// as zero.
+fn complete_window_ns(ring: &[u64], open: &[(u32, u32)], current: u64) -> Vec<u64> {
+    let nr = ring.len() as u64;
+    let Some(newest) = current.checked_sub(2) else {
+        return Vec::new();
+    };
+    let oldest = (current + 1).saturating_sub(nr);
+    let tag_mask = (1u64 << (64 - UTIL_TAG_SHIFT)) - 1;
+    let value_mask = (1u64 << UTIL_TAG_SHIFT) - 1;
+
+    (oldest..=newest)
+        .map(|win| {
+            let slot = ring[(win % nr) as usize];
+            let published = if slot >> UTIL_TAG_SHIFT == win & tag_mask {
+                slot & value_mask
+            } else {
+                0
+            };
+            let pending: u64 = open
+                .iter()
+                .filter(|(open_win, _)| *open_win == win as u32)
+                .map(|(_, ns)| *ns as u64)
+                .sum();
+            published + pending
+        })
+        .collect()
+}
+
+/// Nearest-rank quantile of `samples`, which it sorts. No samples read as zero.
+fn quantile(samples: &mut [f64], q: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = (q * samples.len() as f64).ceil() as usize;
+    samples[rank.clamp(1, samples.len()) - 1]
+}
+
+/// CPUs a subcell is sized for: its usage quantile, with the smoothed demand
+/// flow as the floor. Usage is capped by the CPUs a subcell can get, the
+/// demand flow is not, so a subcell short of CPUs keeps asking for them.
+fn subcell_need(smoothed_demand: f64, util_quantile: f64) -> f64 {
+    smoothed_demand.max(util_quantile)
+}
+
+/// CLOCK_MONOTONIC in ns, the clock BPF attributes utilization windows on.
+fn monotonic_now_ns() -> Result<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        bail!(
+            "clock_gettime(CLOCK_MONOTONIC) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+}
 /// Epoll token for inotify events (cgroup creation/destruction)
 const INOTIFY_TOKEN: u64 = 1;
 /// Epoll token for stats request wakeups
@@ -226,6 +297,13 @@ struct Opts {
     #[clap(long, default_value = "0.3", value_parser = parse_ewma_factor)]
     demand_smoothing: f64,
 
+    /// Quantile of each subcell's CPU usage over its last 3 s of 100 ms
+    /// windows that the subcell is sized for, with rebalancing. 0.9 covers
+    /// all but the busiest tenth of windows; 0 sizes subcells by smoothed
+    /// demand alone (default: 0.9).
+    #[clap(long, default_value_t = 0.9)]
+    util_quantile: f64,
+
     /// Dynamically reassign multi-CPU affinitized tasks on each wake: prefer an
     /// idle CPU within the mask, fall back to random. Redistribute at enqueue if
     /// the target CPU already has queued work.
@@ -359,6 +437,10 @@ struct Scheduler<'a> {
     smoothed_subcell_load: [[f64; MAX_SUBCELLS_PER_CELL]; MAX_CELLS],
     /// EWMA-smoothed demand (CPUs) per subcell
     smoothed_subcell_demand: [[f64; MAX_SUBCELLS_PER_CELL]; MAX_CELLS],
+    /// Quantile of CPU usage a subcell is sized for; zero disables it
+    util_quantile: f64,
+    /// That quantile of each subcell's usage over its complete windows (CPUs)
+    subcell_util_quantile: [[f64; MAX_SUBCELLS_PER_CELL]; MAX_CELLS],
     /// Last time rebalancing was performed
     last_rebalance: Instant,
     /// Number of rebalancing events
@@ -480,6 +562,13 @@ impl<'a> Scheduler<'a> {
         rodata.slice_shrink_multiplier = 2;
         rodata.slice_shrink_min_ns = opts.slice_shrink_min_us * 1_000;
 
+        if !(0.0..=1.0).contains(&opts.util_quantile) {
+            bail!(
+                "--util-quantile ({}) must be between 0 and 1",
+                opts.util_quantile
+            );
+        }
+
         rodata.nr_possible_cpus = *NR_CPUS_POSSIBLE as u32;
         for cpu in topology.all_cpus.keys() {
             rodata.all_cpus[cpu / 8] |= 1 << (cpu % 8);
@@ -600,6 +689,8 @@ impl<'a> Scheduler<'a> {
             smoothed_subcell_util: [[0.0; MAX_SUBCELLS_PER_CELL]; MAX_CELLS],
             smoothed_subcell_load: [[0.0; MAX_SUBCELLS_PER_CELL]; MAX_CELLS],
             smoothed_subcell_demand: [[0.0; MAX_SUBCELLS_PER_CELL]; MAX_CELLS],
+            util_quantile: opts.util_quantile,
+            subcell_util_quantile: [[0.0; MAX_SUBCELLS_PER_CELL]; MAX_CELLS],
             last_rebalance: Instant::now(),
             rebalance_count: 0,
             epoll,
@@ -797,6 +888,7 @@ impl<'a> Scheduler<'a> {
             self.smoothed_subcell_util[cell_id as usize] = [0.0; MAX_SUBCELLS_PER_CELL];
             self.smoothed_subcell_load[cell_id as usize] = [0.0; MAX_SUBCELLS_PER_CELL];
             self.smoothed_subcell_demand[cell_id as usize] = [0.0; MAX_SUBCELLS_PER_CELL];
+            self.subcell_util_quantile[cell_id as usize] = [0.0; MAX_SUBCELLS_PER_CELL];
         }
 
         let cpu_assignments = self
@@ -1073,6 +1165,18 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    /// CPUs a subcell is sized for. Out-of-range ids read as zero.
+    fn subcell_need_cpus(&self, cell: u32, subcell: u32) -> f64 {
+        let (cell, subcell) = (cell as usize, subcell as usize);
+        if cell >= MAX_CELLS || subcell >= MAX_SUBCELLS_PER_CELL {
+            return 0.0;
+        }
+        subcell_need(
+            self.smoothed_subcell_demand[cell][subcell],
+            self.subcell_util_quantile[cell][subcell],
+        )
+    }
+
     fn compute_subcell_assignments(
         &self,
         cell_cpu_assignments: &[CpuAssignment],
@@ -1085,21 +1189,14 @@ impl<'a> Scheduler<'a> {
                     .get(&cell_assignment.id)
                     .map(|cell| {
                         let use_demand = self.enable_rebalancing
-                            && (cell_assignment.id as usize) < MAX_CELLS
                             && cell.subcells.iter().any(|subcell| {
-                                (subcell.id as usize) < MAX_SUBCELLS_PER_CELL
-                                    && self.smoothed_subcell_demand[cell_assignment.id as usize]
-                                        [subcell.id as usize]
-                                        > 0.0
+                                self.subcell_need_cpus(cell_assignment.id, subcell.id) > 0.0
                             });
                         cell.subcells
                             .iter()
                             .map(|subcell| {
-                                let weight = if use_demand
-                                    && (subcell.id as usize) < MAX_SUBCELLS_PER_CELL
-                                {
-                                    self.smoothed_subcell_demand[cell_assignment.id as usize]
-                                        [subcell.id as usize]
+                                let weight = if use_demand {
+                                    self.subcell_need_cpus(cell_assignment.id, subcell.id)
                                 } else {
                                     1.0
                                 };
@@ -1824,6 +1921,23 @@ impl<'a> Scheduler<'a> {
         let subcell_accounts = read_subcell_accounts(&self.skel, active_subcells.keys().copied())
             .context("reading subcell accounts")?;
 
+        if self.enable_rebalancing && self.util_quantile > 0.0 {
+            let current_window = monotonic_now_ns()? / UTIL_WINDOW_NS;
+            for (&(cell, subcell), per_cpu_accounts) in &subcell_accounts {
+                let ring = read_subcell_util_ring(&self.skel, cell, subcell)
+                    .context("reading subcell utilization windows")?;
+                let open: Vec<(u32, u32)> = per_cpu_accounts
+                    .iter()
+                    .map(|account| (account.util_win, account.util_win_ns))
+                    .collect();
+                let mut cpus: Vec<f64> = complete_window_ns(&ring, &open, current_window)
+                    .into_iter()
+                    .map(|ns| ns as f64 / UTIL_WINDOW_NS as f64)
+                    .collect();
+                self.subcell_util_quantile[cell][subcell] = quantile(&mut cpus, self.util_quantile);
+            }
+        }
+
         for (cpu, cpu_ctx) in cpu_ctxs.iter().enumerate() {
             let owner_cell = cpu_ctx.cell as usize;
             let owner_subcell = cpu_ctx.subcell as usize;
@@ -1944,6 +2058,11 @@ impl<'a> Scheduler<'a> {
                     subcell_metrics.smoothed_util_pct = self.smoothed_subcell_util[cell][subcell];
                     subcell_metrics.smoothed_load = self.smoothed_subcell_load[cell][subcell];
                     subcell_metrics.smoothed_demand = self.smoothed_subcell_demand[cell][subcell];
+                    subcell_metrics.util_quantile = self.subcell_util_quantile[cell][subcell];
+                    subcell_metrics.need = subcell_need(
+                        self.smoothed_subcell_demand[cell][subcell],
+                        self.subcell_util_quantile[cell][subcell],
+                    );
                 }
             }
         }
@@ -2404,6 +2523,38 @@ where
     Ok(accounts_by_subcell)
 }
 
+/// The shared utilization ring of one subcell, as its raw slots.
+fn read_subcell_util_ring(skel: &BpfSkel, cell: usize, subcell: usize) -> Result<Vec<u64>> {
+    if cell >= MAX_CELLS || subcell >= MAX_SUBCELLS_PER_CELL {
+        bail!(
+            "Invalid subcell ring key {}:{} (max {}:{})",
+            cell,
+            subcell,
+            MAX_CELLS,
+            MAX_SUBCELLS_PER_CELL
+        );
+    }
+    let packed = ((cell * MAX_SUBCELLS_PER_CELL) + subcell) as u32;
+    let value = skel
+        .maps
+        .subcell_util_rings
+        .lookup(&packed.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
+        .with_context(|| format!("Failed to lookup subcell_util_rings key {}", packed))?
+        .with_context(|| format!("subcell_util_rings key {} is missing", packed))?;
+    if value.len() < NR_UTIL_WINDOWS * std::mem::size_of::<u64>() {
+        bail!(
+            "subcell_util_rings key {} value is too small: {}",
+            packed,
+            value.len()
+        );
+    }
+    Ok(value
+        .chunks_exact(std::mem::size_of::<u64>())
+        .take(NR_UTIL_WINDOWS)
+        .map(|chunk| u64::from_ne_bytes(chunk.try_into().expect("chunk is eight bytes")))
+        .collect())
+}
+
 fn run(opts: Opts) -> Result<()> {
     if opts.version {
         println!(
@@ -2503,7 +2654,11 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CpuAssignment, Cpumask, Opts, validate_subcell_assignments};
+    use super::{
+        CpuAssignment, Cpumask, NR_UTIL_WINDOWS, Opts, UTIL_TAG_SHIFT, complete_window_ns,
+        quantile, subcell_need, validate_subcell_assignments,
+    };
+    use crate::cell_manager::{CellManager, CpuRecipient};
     use clap::Parser;
 
     fn cpumask(cpus: &[usize]) -> Cpumask {
@@ -2584,5 +2739,82 @@ mod tests {
         let subcells = [assignment(0, &[0, 1, 2], None)];
 
         assert!(validate_subcell_assignments(&cell, &subcells, false).is_err());
+    }
+
+    fn slot(win: u64, ns: u64) -> u64 {
+        ((win & 0xffff) << UTIL_TAG_SHIFT) | ns
+    }
+
+    #[test]
+    fn complete_windows_skip_open_and_stale_slots() {
+        let current = 1000u64;
+        let mut ring = vec![0u64; NR_UTIL_WINDOWS];
+        // The two newest windows are not complete yet.
+        ring[(current % 32) as usize] = slot(current, 7);
+        ring[((current - 1) % 32) as usize] = slot(current - 1, 7);
+        // A complete window, a slot still holding the window lapped 32 ago,
+        // and a window with time still open on two CPUs.
+        ring[((current - 2) % 32) as usize] = slot(current - 2, 300);
+        ring[((current - 3) % 32) as usize] = slot(current - 3 - 32, 999);
+        ring[((current - 4) % 32) as usize] = slot(current - 4, 100);
+        let open = [
+            ((current - 4) as u32, 50u32),
+            ((current - 4) as u32, 25),
+            (current as u32, 9),
+        ];
+
+        let windows = complete_window_ns(&ring, &open, current);
+        assert_eq!(windows.len(), NR_UTIL_WINDOWS - 2);
+        assert_eq!(windows[windows.len() - 1], 300);
+        assert_eq!(windows[windows.len() - 2], 0);
+        assert_eq!(windows[windows.len() - 3], 175);
+        assert!(windows[..windows.len() - 3].iter().all(|&ns| ns == 0));
+    }
+
+    #[test]
+    fn quantile_is_nearest_rank() {
+        let mut samples = vec![4.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert_eq!(quantile(&mut samples, 0.9), 4.0);
+        assert_eq!(quantile(&mut samples, 0.8), 0.0);
+        assert_eq!(quantile(&mut samples, 1.0), 4.0);
+        assert_eq!(quantile(&mut [], 0.9), 0.0);
+        assert_eq!(subcell_need(1.0, 4.0), 4.0);
+        assert_eq!(subcell_need(1.0, 0.5), 1.0);
+    }
+
+    #[test]
+    fn bursty_subcell_is_sized_for_its_usage_quantile() {
+        // An eight-CPU cell with a bursty subcell (mean one CPU, bursts of
+        // four for a quarter of its windows), a steady subcell at three CPUs
+        // and an idle catch-all.
+        let domain = cpumask(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let split = |bursty: f64, steady: f64| {
+            let recipients = vec![
+                CpuRecipient::unpinned(0, bursty, &domain),
+                CpuRecipient::unpinned(1, steady, &domain),
+                CpuRecipient::unpinned(2, 0.0, &domain),
+            ];
+            let assignments =
+                CellManager::compute_subcell_cpu_assignments(&domain, &recipients, true).unwrap();
+            let cpus = |id: u32| {
+                assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap()
+                    .primary
+                    .weight()
+            };
+            (cpus(0), cpus(1), cpus(2))
+        };
+        let mut bursty_windows: Vec<f64> = (0..20)
+            .map(|i| if i % 4 == 0 { 4.0 } else { 0.0 })
+            .collect();
+        let bursty_p90 = quantile(&mut bursty_windows, 0.9);
+        assert_eq!(bursty_p90, 4.0);
+
+        // Sized by mean demand the bursty subcell gets two CPUs and its
+        // bursts spill onto borrowed ones; sized by need it gets four.
+        assert_eq!(split(1.0, 3.0), (2, 5, 1));
+        assert_eq!(split(subcell_need(1.0, bursty_p90), 3.0), (4, 3, 1));
     }
 }
