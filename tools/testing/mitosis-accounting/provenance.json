@@ -3,10 +3,10 @@
   "pr": 3817,
   "base": "fead94e15184e957469b346b129f412641691bbe",
   "unfixed_tip": "a364640c450361fa97eaafe29853a1351ca75cd0",
-  "fixed_tip": "252d70cc1fabcd280084679529712b8f76dc36c7",
+  "fixed_tip": "429b59bf59fc531a31ba65be0c920cd209925c33",
   "source_path": "scheds/rust/scx_mitosis/src/bpf/mitosis.bpf.c",
   "unfixed_source_sha256": "5267eab95d1ee867f93e4011920bfbc71f73221c1c76475a36439b91c87a1bab",
-  "fixed_source_sha256": "882f0c50fcdd5f2d15dbecb25bb6e4d0deba15ea867da3df84d91cad1de77b20",
+  "fixed_source_sha256": "7c79f0512dc73c25e7063defd49c891caf5e5533ffe7e71fc600bf9486321228",
   "compiler": "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
-  "result": "14 regressions fail before, all 17 cases pass after; 3 controls pass both"
+  "result": "12 regressions fail before and pass after; 5 controls pass both; 2 retained skew-accuracy cases fail as expected on both"
 }

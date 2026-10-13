@@ -12,14 +12,6 @@
       "passed": false,
       "expected_result": true
     },
-    "queued-clock": {
-      "passed": false,
-      "expected_result": true
-    },
-    "sleep-clock": {
-      "passed": false,
-      "expected_result": true
-    },
     "error-running-cell": {
       "passed": false,
       "expected_result": true
@@ -64,8 +56,24 @@
       "passed": true,
       "expected_result": true
     },
-    "wall-demand-window": {
+    "sched-demand-window": {
       "passed": true,
+      "expected_result": true
+    },
+    "queued-sched-clock": {
+      "passed": true,
+      "expected_result": true
+    },
+    "sleep-sched-clock": {
+      "passed": true,
+      "expected_result": true
+    },
+    "queued-clock": {
+      "passed": false,
+      "expected_result": true
+    },
+    "sleep-clock": {
+      "passed": false,
       "expected_result": true
     }
   },
@@ -82,14 +90,6 @@
       "passed": true,
       "expected_result": true
     },
-    "queued-clock": {
-      "passed": true,
-      "expected_result": true
-    },
-    "sleep-clock": {
-      "passed": true,
-      "expected_result": true
-    },
     "error-running-cell": {
       "passed": true,
       "expected_result": true
@@ -134,8 +134,24 @@
       "passed": true,
       "expected_result": true
     },
-    "wall-demand-window": {
+    "sched-demand-window": {
       "passed": true,
+      "expected_result": true
+    },
+    "queued-sched-clock": {
+      "passed": true,
+      "expected_result": true
+    },
+    "sleep-sched-clock": {
+      "passed": true,
+      "expected_result": true
+    },
+    "queued-clock": {
+      "passed": false,
+      "expected_result": true
+    },
+    "sleep-clock": {
+      "passed": false,
       "expected_result": true
     }
   }

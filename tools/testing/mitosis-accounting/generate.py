@@ -117,6 +117,14 @@ int main(int argc,char **argv) {
   global_time=5000; local_time[0]=1000; mitosis_quiescent(&task,0);
   executing=1; global_time=5100; local_time[1]=200; mitosis_runnable(&task,0);
   CHECK(taskctx.window_sleep_ns==100); CHECK(taskctx.quiescent_at==0);
+ } else if(!strcmp(name,"queued-sched-clock")) {
+  global_time=5000; local_time[0]=1000; mitosis_runnable(&task,0);
+  executing=1; global_time=5100; local_time[1]=1140; mitosis_running(&task);
+  CHECK(accounts[1][0].queued_ns==140); CHECK(taskctx.runnable_at==0);
+ } else if(!strcmp(name,"sleep-sched-clock")) {
+  global_time=5000; local_time[0]=1000; mitosis_quiescent(&task,0);
+  executing=1; global_time=5100; local_time[1]=1140; mitosis_runnable(&task,0);
+  CHECK(taskctx.window_sleep_ns==140); CHECK(taskctx.quiescent_at==0);
  } else if(!strcmp(name,"error-running-cell")) {
   taskctx.cell=2; mitosis_dispatch(1,&task); CHECK(errors); CHECK(!refills);
  } else if(!strcmp(name,"error-running-pack")) {
@@ -149,11 +157,11 @@ int main(int argc,char **argv) {
   clock_at(1350); task_time[0]=150; mitosis_stopping(&task,true);
   CHECK(cpus[1].running_ns[0]==200); CHECK(cpus[0].running_ns[0]==50);
   CHECK(accounts[1][0].running_ns==200); CHECK(accounts[0][0].running_ns==50);
- } else if(!strcmp(name,"wall-demand-window")) {
-  executing=1; clock_at(1000000); task_time[1]=1000; mitosis_running(&task);
-  taskctx.demand_window_at=global_time;
-  clock_at(1000000+2*DEMAND_TAU_NS); task_time[1]=1200; mitosis_tick(&task);
-  CHECK(taskctx.demand_window_at==global_time); CHECK(taskctx.window_run_ns==0);
+ } else if(!strcmp(name,"sched-demand-window")) {
+  executing=1; clock_at(1000000); global_time=7000000; task_time[1]=1000;
+  mitosis_running(&task); taskctx.demand_window_at=local_time[1];
+  local_time[1]+=2*DEMAND_TAU_NS; task_time[1]=1200; mitosis_tick(&task);
+  CHECK(taskctx.demand_window_at==local_time[1]); CHECK(taskctx.window_run_ns==0);
  } else if(!strcmp(name,"no-wait")) {
   map_fail=true; mitosis_quiescent(&task,0); CHECK(!errors); CHECK(taskctx.quiescent_at==1500);
  } else if(!strcmp(name,"shared-accounting")) {

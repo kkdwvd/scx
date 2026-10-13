@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Extracted callback bodies: Copyright (c) Meta Platforms, Inc. and affiliates. */
-/* Source SHA-256: 882f0c50fcdd5f2d15dbecb25bb6e4d0deba15ea867da3df84d91cad1de77b20 */
+/* Source SHA-256: 7c79f0512dc73c25e7063defd49c891caf5e5533ffe7e71fc600bf9486321228 */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -137,8 +137,8 @@ static __always_inline int account_task_running(s32 cpu, struct cpu_ctx *cctx, s
 	*running += used;
 	account->running_ns += used;
 	tctx->window_run_ns += used;
-	/* Demand windows span sleeps and migrations, so use elapsed wall time. */
-	update_task_demand(tctx, account, bpf_ktime_get_ns(), stopping);
+	/* Keep demand windows on the scheduler wall clock. */
+	update_task_demand(tctx, account, scx_bpf_now(), stopping);
 	return 0;
 }
 void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
@@ -310,7 +310,7 @@ void BPF_STRUCT_OPS(mitosis_runnable, struct task_struct *p, u64 enq_flags)
 	if (!(tctx = lookup_task_ctx(p)))
 		return;
 
-	now = bpf_ktime_get_ns();
+	now = scx_bpf_now();
 	if (tctx->quiescent_at) {
 		tctx->window_sleep_ns += time_delta(now, tctx->quiescent_at);
 		tctx->quiescent_at = 0;
@@ -324,7 +324,7 @@ void BPF_STRUCT_OPS(mitosis_quiescent, struct task_struct *p, u64 deq_flags)
 	if (!(tctx = lookup_task_ctx(p)))
 		return;
 
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now();
 
 	/* Dequeued without running again: close the wait it was in, if any. */
 	if (account_task_queued(tctx, now) < 0)
@@ -356,12 +356,12 @@ void BPF_STRUCT_OPS(mitosis_running, struct task_struct *p)
 			advance_subcell_llc_vtime(subcell, (u32)llc, p->scx.dsq_vtime);
 	}
 
-	now = bpf_ktime_get_ns();
+	now = scx_bpf_now();
 	/* The task waited from its last runnable mark until now. */
 	if (account_task_queued(tctx, now) < 0)
 		return;
 	/* Record the running slice start time. */
-	tctx->started_running_at = scx_bpf_now();
+	tctx->started_running_at = now;
 	tctx->running_accounted_at = scx_clock_task(scx_bpf_task_cpu(p));
 
 	/* Shrink our slice if a pinned task is queued on this CPU's DSQ. */
@@ -469,7 +469,6 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 	tctx->borrowed = false;
 
 	/* Charge whatever the slice extensions since the last flush left over. */
-	now = bpf_ktime_get_ns();
 	if (account_task_running(scx_bpf_task_cpu(p), cctx, tctx, scx_clock_task(scx_bpf_task_cpu(p)), true) < 0)
 		return;
 
@@ -503,6 +502,14 @@ int main(int argc,char **argv) {
   global_time=5000; local_time[0]=1000; mitosis_quiescent(&task,0);
   executing=1; global_time=5100; local_time[1]=200; mitosis_runnable(&task,0);
   CHECK(taskctx.window_sleep_ns==100); CHECK(taskctx.quiescent_at==0);
+ } else if(!strcmp(name,"queued-sched-clock")) {
+  global_time=5000; local_time[0]=1000; mitosis_runnable(&task,0);
+  executing=1; global_time=5100; local_time[1]=1140; mitosis_running(&task);
+  CHECK(accounts[1][0].queued_ns==140); CHECK(taskctx.runnable_at==0);
+ } else if(!strcmp(name,"sleep-sched-clock")) {
+  global_time=5000; local_time[0]=1000; mitosis_quiescent(&task,0);
+  executing=1; global_time=5100; local_time[1]=1140; mitosis_runnable(&task,0);
+  CHECK(taskctx.window_sleep_ns==140); CHECK(taskctx.quiescent_at==0);
  } else if(!strcmp(name,"error-running-cell")) {
   taskctx.cell=2; mitosis_dispatch(1,&task); CHECK(errors); CHECK(!refills);
  } else if(!strcmp(name,"error-running-pack")) {
@@ -535,11 +542,11 @@ int main(int argc,char **argv) {
   clock_at(1350); task_time[0]=150; mitosis_stopping(&task,true);
   CHECK(cpus[1].running_ns[0]==200); CHECK(cpus[0].running_ns[0]==50);
   CHECK(accounts[1][0].running_ns==200); CHECK(accounts[0][0].running_ns==50);
- } else if(!strcmp(name,"wall-demand-window")) {
-  executing=1; clock_at(1000000); task_time[1]=1000; mitosis_running(&task);
-  taskctx.demand_window_at=global_time;
-  clock_at(1000000+2*DEMAND_TAU_NS); task_time[1]=1200; mitosis_tick(&task);
-  CHECK(taskctx.demand_window_at==global_time); CHECK(taskctx.window_run_ns==0);
+ } else if(!strcmp(name,"sched-demand-window")) {
+  executing=1; clock_at(1000000); global_time=7000000; task_time[1]=1000;
+  mitosis_running(&task); taskctx.demand_window_at=local_time[1];
+  local_time[1]+=2*DEMAND_TAU_NS; task_time[1]=1200; mitosis_tick(&task);
+  CHECK(taskctx.demand_window_at==local_time[1]); CHECK(taskctx.window_run_ns==0);
  } else if(!strcmp(name,"no-wait")) {
   map_fail=true; mitosis_quiescent(&task,0); CHECK(!errors); CHECK(taskctx.quiescent_at==1500);
  } else if(!strcmp(name,"shared-accounting")) {

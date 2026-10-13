@@ -18,16 +18,20 @@ differs from its expectation. `CC` can select another C compiler. Temporary
 executables are removed automatically. `results.json` records the observed
 results; `provenance.json` records source revisions, hashes, and compiler.
 
-The unfixed snapshot fails all fourteen regressions. The fixed snapshot passes
-all seventeen cases. All three normal-path controls pass on both snapshots.
+The runner checks nineteen cases per snapshot. The fixed snapshot passes all
+twelve regression cases and five controls; the unfixed snapshot fails those
+twelve regressions and passes the controls. Two retained skew-accuracy cases
+are expected to fail on both: the requested clock policy keeps scx_bpf_now()
+for off-CPU intervals and does not promise accurate cross-CPU deltas under
+clock skew. The runner checks these expected failures explicitly.
 
 | Case | Invariant checked |
 | --- | --- |
 | `remote-context` | CPU 0 dispatching CPU 1 charges CPU 1's cell counter, even when their cells differ. |
 | `remote-clock` | A running timestamp of 1000 ns and remote dispatch at global 1500 ns charge 500 ns despite the executing CPU's local clock reading 500 ns. |
 | `remote-subcell` | Remote dispatch charges the target CPU's subcell slot, preserving CPU-based borrowed/lent attribution. |
-| `queued-clock` | A 100 ns wait survives migration between CPUs whose local clocks are skewed. |
-| `sleep-clock` | A 100 ns sleep survives a wakeup on a CPU with a different local clock. |
+| `queued-clock` | Known limitation: a real 100 ns wait is lost when the destination scheduler clock is behind the source clock. Expected failure on both snapshots. |
+| `sleep-clock` | Known limitation: a real 100 ns sleep is lost after waking on a CPU whose scheduler clock is behind. Expected failure on both snapshots. |
 | `error-running-cell` | An invalid task cell prevents slice refill after the error. |
 | `error-running-pack` | An invalid subcell prevents slice refill after the error. |
 | `error-running-map` | A missing runtime accounting slot prevents slice refill. |
@@ -37,7 +41,9 @@ all seventeen cases. All three normal-path controls pass on both snapshots.
 | `error-running-queued` | Failed queued accounting prevents replacement of slice-start timestamps. |
 | `runtime-excludes-nontask` | With different wall and task clock origins, charge only 350 ns of task time during a 500 ns wall interval containing 150 ns of non-task time. |
 | `runtime-migration` | Reset the runtime baseline on a new CPU whose task clock is behind the old CPU's; retain 200 ns and 50 ns from the two runs. |
-| `wall-demand-window` | Close demand windows on elapsed wall time even when the task clock has a different origin and rate. |
+| `sched-demand-window` | Close demand windows according to scx_bpf_now(), independently of task-clock and ktime origins and rates. |
+| `queued-sched-clock` | Preserve the 140 ns scheduler-clock wait when ktime advances by 100 ns. |
+| `sleep-sched-clock` | Preserve the 140 ns scheduler-clock sleep when ktime advances by 100 ns. |
 | `no-wait` | A task with no open wait succeeds without looking up an accounting slot. |
 | `shared-accounting` | Running, tick, slice extension, and stopping charge a 200 ns run exactly once, retaining normal vtime charging. |
 
@@ -79,9 +85,11 @@ sibling-runqueue dispatch paths and `scx_bpf_now()`'s use of `this_rq()`.
 Runtime uses the target CPU's `scx_clock_task()` / `rq->clock_task` so
 accounted IRQ and steal time are excluded. The running callback resets its
 baseline after migration. Queued and sleeping intervals, and the elapsed
-window used for demand estimation, use `bpf_ktime_get_ns()` across CPUs.
-The harness supplies separate wall and per-CPU task clocks to verify that
-these timestamp domains are not mixed.
+window used for demand estimation, retain `scx_bpf_now()`, consistent with
+layered and LAVD. Cross-CPU scheduler-clock skew remains an accepted limitation
+of these metrics; negative deltas are clamped. The harness supplies separate
+ktime, scheduler, and per-CPU task clocks to check the intended distinction.
+The two original skew-accuracy tests remain visible as expected failures.
 
 The extracted scheduler bodies retain Meta's copyright notice and are provided
 under GPL-2.0-only, as is this harness. See the repository's `LICENSE`.
