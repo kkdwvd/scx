@@ -15,8 +15,9 @@ REGRESSIONS = [
     'sleep-clock', 'error-running-cell', 'error-running-pack',
     'error-running-map', 'error-stopping-map', 'error-quiescent-pack',
     'error-quiescent-map', 'error-running-queued',
+    'runtime-excludes-nontask', 'runtime-migration',
 ]
-CONTROLS = ['no-wait', 'shared-accounting']
+CONTROLS = ['no-wait', 'shared-accounting', 'wall-demand-window']
 results = {}
 ok = True
 with tempfile.TemporaryDirectory(prefix='mitosis-accounting-') as tmp:

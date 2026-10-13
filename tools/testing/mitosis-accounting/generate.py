@@ -57,12 +57,13 @@ struct cpu_ctx { u32 cell,subcell,llc; u64 vtime_now,running_ns[2],pinned_waitin
 struct subcell { u64 llcs_to_drain; } sub;
 struct subcell_account { u64 running_ns,queued_ns,demand_sum; } accounts[2][4];
 int subcell_accounts,executing,errors,refills; bool map_fail;
-u64 local_time[2],global_time,slice_ns=20000000;
+u64 local_time[2],task_time[2],global_time,slice_ns=20000000;
 bool enable_llc_awareness,enable_slice_shrinking; u32 nr_llc=1;
 static inline u64 time_delta(u64 after,u64 before) { return (int64_t)(after-before)>0 ? after-before : 0; }
 static inline bool time_before(u64 a,u64 b) { return (int64_t)(a-b)<0; }
 static u64 scx_bpf_now(void) { return local_time[executing]; }
 static u64 bpf_ktime_get_ns(void) { return global_time; }
+static u64 scx_clock_task(u32 cpu) { return task_time[cpu]; }
 static int scx_bpf_task_cpu(struct task_struct *p) { return p->cpu; }
 static struct cpu_ctx *lookup_cpu_ctx(int cpu) { return &cpus[cpu<0 ? executing : cpu]; }
 static struct task_ctx *lookup_task_ctx(struct task_struct *p) { return &taskctx; }
@@ -90,7 +91,7 @@ static void scx_bpf_task_set_dsq_vtime(struct task_struct *p,u64 vtime) { p->scx
 '''
 driver = r'''
 #define CHECK(c) do { if(!(c)) { fprintf(stderr,"%s:%d: %s\n",name,__LINE__,#c); return 1; } } while(0)
-static void clock_at(u64 now) { global_time=now; local_time[0]=local_time[1]=now; }
+static void clock_at(u64 now) { global_time=now; local_time[0]=local_time[1]=now; task_time[0]=task_time[1]=now; }
 int main(int argc,char **argv) {
  const char *name=argv[1];
  task.cpu=1; task.pid=42; task.scx.flags=SCX_TASK_QUEUED; task.scx.weight=100;
@@ -101,8 +102,10 @@ int main(int argc,char **argv) {
   CHECK(cpus[1].running_ns[0]==500); CHECK(cpus[0].running_ns[0]==0);
  } else if(!strcmp(name,"remote-clock")) {
   executing=1; clock_at(1000); mitosis_running(&task);
-  executing=0; clock_at(1500); local_time[0]=500;
-  mitosis_dispatch(1,&task); CHECK(cpus[1].running_ns[0]==500);
+  executing=0; clock_at(1500); local_time[0]=500; task_time[0]=500;
+  mitosis_dispatch(1,&task);
+  CHECK(cpus[0].running_ns[0]+cpus[1].running_ns[0]==500);
+  CHECK(cpus[1].running_ns[0]==500);
   CHECK(taskctx.running_accounted_at==1500);
  } else if(!strcmp(name,"remote-subcell")) {
   mitosis_dispatch(1,&task); CHECK(accounts[1][0].running_ns==500); CHECK(accounts[0][0].running_ns==0);
@@ -132,6 +135,25 @@ int main(int argc,char **argv) {
  } else if(!strcmp(name,"error-running-queued")) {
   taskctx.runnable_at=500; map_fail=true; executing=1; mitosis_running(&task);
   CHECK(errors); CHECK(taskctx.running_accounted_at==1000); CHECK(taskctx.started_running_at==1000);
+ } else if(!strcmp(name,"runtime-excludes-nontask")) {
+  executing=1; clock_at(5000000000ULL); task_time[1]=1000;
+  mitosis_running(&task);
+  clock_at(5000000500ULL); task_time[1]=1350; mitosis_tick(&task);
+  CHECK(cpus[1].running_ns[0]==350); CHECK(accounts[1][0].running_ns==350);
+  CHECK(taskctx.running_accounted_at==1350);
+ } else if(!strcmp(name,"runtime-migration")) {
+  executing=1; clock_at(1000); mitosis_running(&task);
+  clock_at(1200); mitosis_stopping(&task,true);
+  task.cpu=0; executing=0; clock_at(1300); task_time[0]=100;
+  mitosis_running(&task); CHECK(taskctx.running_accounted_at==100);
+  clock_at(1350); task_time[0]=150; mitosis_stopping(&task,true);
+  CHECK(cpus[1].running_ns[0]==200); CHECK(cpus[0].running_ns[0]==50);
+  CHECK(accounts[1][0].running_ns==200); CHECK(accounts[0][0].running_ns==50);
+ } else if(!strcmp(name,"wall-demand-window")) {
+  executing=1; clock_at(1000000); task_time[1]=1000; mitosis_running(&task);
+  taskctx.demand_window_at=global_time;
+  clock_at(1000000+2*DEMAND_TAU_NS); task_time[1]=1200; mitosis_tick(&task);
+  CHECK(taskctx.demand_window_at==global_time); CHECK(taskctx.window_run_ns==0);
  } else if(!strcmp(name,"no-wait")) {
   map_fail=true; mitosis_quiescent(&task,0); CHECK(!errors); CHECK(taskctx.quiescent_at==1500);
  } else if(!strcmp(name,"shared-accounting")) {

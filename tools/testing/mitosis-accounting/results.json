@@ -48,11 +48,23 @@
       "passed": false,
       "expected_result": true
     },
+    "runtime-excludes-nontask": {
+      "passed": false,
+      "expected_result": true
+    },
+    "runtime-migration": {
+      "passed": false,
+      "expected_result": true
+    },
     "no-wait": {
       "passed": true,
       "expected_result": true
     },
     "shared-accounting": {
+      "passed": true,
+      "expected_result": true
+    },
+    "wall-demand-window": {
       "passed": true,
       "expected_result": true
     }
@@ -106,11 +118,23 @@
       "passed": true,
       "expected_result": true
     },
+    "runtime-excludes-nontask": {
+      "passed": true,
+      "expected_result": true
+    },
+    "runtime-migration": {
+      "passed": true,
+      "expected_result": true
+    },
     "no-wait": {
       "passed": true,
       "expected_result": true
     },
     "shared-accounting": {
+      "passed": true,
+      "expected_result": true
+    },
+    "wall-demand-window": {
       "passed": true,
       "expected_result": true
     }

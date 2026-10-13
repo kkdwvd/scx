@@ -18,8 +18,8 @@ differs from its expectation. `CC` can select another C compiler. Temporary
 executables are removed automatically. `results.json` records the observed
 results; `provenance.json` records source revisions, hashes, and compiler.
 
-The unfixed snapshot fails all twelve regressions. The fixed snapshot passes
-all fourteen cases. Both normal-path controls pass on both snapshots.
+The unfixed snapshot fails all fourteen regressions. The fixed snapshot passes
+all seventeen cases. All three normal-path controls pass on both snapshots.
 
 | Case | Invariant checked |
 | --- | --- |
@@ -35,6 +35,9 @@ all fourteen cases. Both normal-path controls pass on both snapshots.
 | `error-quiescent-pack` | Invalid queued-accounting placement leaves later quiescent state untouched. |
 | `error-quiescent-map` | A missing queued-accounting slot leaves later quiescent state untouched. |
 | `error-running-queued` | Failed queued accounting prevents replacement of slice-start timestamps. |
+| `runtime-excludes-nontask` | With different wall and task clock origins, charge only 350 ns of task time during a 500 ns wall interval containing 150 ns of non-task time. |
+| `runtime-migration` | Reset the runtime baseline on a new CPU whose task clock is behind the old CPU's; retain 200 ns and 50 ns from the two runs. |
+| `wall-demand-window` | Close demand windows on elapsed wall time even when the task clock has a different origin and rate. |
 | `no-wait` | A task with no open wait succeeds without looking up an accounting slot. |
 | `shared-accounting` | Running, tick, slice extension, and stopping charge a 200 ns run exactly once, retaining normal vtime charging. |
 
@@ -73,8 +76,12 @@ not assert that those conditions arise during normal scheduler operation.
 
 The CPU-context premise was checked separately against Linux's core-scheduling
 sibling-runqueue dispatch paths and `scx_bpf_now()`'s use of `this_rq()`.
-`bpf_ktime_get_ns()` preserves wall-time accounting across CPUs. Switching to
-`rq->clock_task` would also change IRQ/steal accounting and is a separate change.
+Runtime uses the target CPU's `scx_clock_task()` / `rq->clock_task` so
+accounted IRQ and steal time are excluded. The running callback resets its
+baseline after migration. Queued and sleeping intervals, and the elapsed
+window used for demand estimation, use `bpf_ktime_get_ns()` across CPUs.
+The harness supplies separate wall and per-CPU task clocks to verify that
+these timestamp domains are not mixed.
 
 The extracted scheduler bodies retain Meta's copyright notice and are provided
 under GPL-2.0-only, as is this harness. See the repository's `LICENSE`.
