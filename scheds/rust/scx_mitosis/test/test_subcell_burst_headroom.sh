@@ -1,13 +1,20 @@
 #!/bin/bash
-# Verify that a bursty, low-utilization subcell is sized for its bursts.
+# Verify that a bursty, low-utilization subcell is sized for its bursts while
+# its cell has slack, and that the headroom tapers off as the cell fills.
 #
 # One configured cell pinned to 8 cores of a single LLC holds three subcells:
 # "bursty" (4 workers that spin 500 ms every 2 s: 1 CPU mean, 4 CPUs peak),
-# "steady" (3 workers spinning continuously) and the catch-all "rest". The
-# scheduler runs twice: sized by smoothed demand alone (--util-quantile 0)
-# and sized for the p90 of CPU usage over 100 ms windows (the default). Sized
-# by demand, bursty gets 2 CPUs and runs half of every burst on borrowed CPUs;
+# "steady" (workers spinning continuously) and the catch-all "rest".
+#
+# With 3 steady workers the cell has slack in every window. The scheduler
+# runs twice: sized by smoothed demand alone (--util-quantile 0) and sized
+# for the p90 of CPU usage over 100 ms windows (the default). Sized by
+# demand, bursty gets 2 CPUs and runs half of every burst on borrowed CPUs;
 # sized for the p90 it gets 4 and borrows nothing.
+#
+# With 6 steady workers the cell is full whenever bursty bursts, so about a
+# quarter of the windows have no slack. The p90 run must then measure that
+# slack and size bursty between its demand and its p90.
 
 set -euo pipefail
 
@@ -174,12 +181,12 @@ PY
 # cgroup; otherwise it would be matched as "bash" into the catch-all subcell
 # until the next configuration refresh.
 start_workers() {
-    local i pid
+    local steady=$1 i pid
     for i in 1 2 3 4; do
         "$WORK_DIR/burstwrk" "$WORK_DIR/burst.py" 2 0.5 &
         WORKER_PIDS+=("$!")
     done
-    for i in 1 2 3; do
+    for i in $(seq 1 "$steady"); do
         "$WORK_DIR/stedywrk" "$WORK_DIR/steady.py" &
         WORKER_PIDS+=("$!")
     done
@@ -189,13 +196,13 @@ start_workers() {
     done
 }
 
-# run_mode <label> <quantile>: run the scheduler with the workers for RUN_SECS
-# and leave the monitor output in $WORK_DIR/<label>.json.
+# run_mode <label> <quantile> <steady workers>: run the scheduler with the
+# workers for RUN_SECS and leave the monitor output in $WORK_DIR/<label>.json.
 run_mode() {
-    local label=$1 quantile=$2
+    local label=$1 quantile=$2 steady=$3
     local log="$WORK_DIR/$label.log" monitor="$WORK_DIR/$label.json"
 
-    echo -e "\n${YELLOW}Running mode '$label' (--util-quantile $quantile) for ${RUN_SECS}s${NC}"
+    echo -e "\n${YELLOW}Running mode '$label' (--util-quantile $quantile, $steady steady workers) for ${RUN_SECS}s${NC}"
     "$SCHEDULER_BIN" --cell-config "$CONFIG" \
         --enable-rebalancing \
         --reconfiguration-interval-s 2 \
@@ -214,7 +221,7 @@ run_mode() {
         exit 1
     fi
 
-    start_workers
+    start_workers "$steady"
     "$SCHEDULER_BIN" --monitor 1 > "$monitor" 2>/dev/null &
     MONITOR_PID=$!
     sleep "$RUN_SECS"
@@ -224,10 +231,11 @@ run_mode() {
     sleep 1
 }
 
-run_mode demand 0
-run_mode p90 0.9
+run_mode demand 0 3
+run_mode p90 0.9 3
+run_mode full 0.9 6
 
-python3 - "$WORK_DIR/demand.json" "$WORK_DIR/p90.json" "$SETTLE_SECS" <<'PY'
+python3 - "$WORK_DIR/demand.json" "$WORK_DIR/p90.json" "$WORK_DIR/full.json" "$SETTLE_SECS" <<'PY'
 import json, statistics, sys
 
 def samples(path):
@@ -245,13 +253,16 @@ def samples(path):
         out.append(obj)
     return out
 
-def burst_cell(sample):
+def burst_cell_entry(sample):
     """The cell whose subcells include "bursty"; cell 0 has its own "rest"."""
     for cell in sample.get("cells", {}).values():
         subs = {sub.get("name"): sub for sub in cell.get("subcells", {}).values()}
         if "bursty" in subs:
-            return subs
-    return {}
+            return cell, subs
+    return {}, {}
+
+def burst_cell(sample):
+    return burst_cell_entry(sample)[1]
 
 def timeline(label, rows):
     print(f"\n{label}: per-sample CPUs (bursty/steady/rest), bursty borrow%, bursty need")
@@ -273,7 +284,11 @@ def summarize(path, label, settle):
         sys.exit(1)
     timeline(label, rows)
     rows = rows[settle:]
-    out = {}
+    out = {
+        "slack": statistics.mean(
+            burst_cell_entry(r)[0].get("slack_fraction", 1.0) for r in rows if burst_cell(r)
+        )
+    }
     for name in ("bursty", "steady", "rest"):
         subs = [s for s in (burst_cell(r).get(name) for r in rows) if s]
         if not subs:
@@ -288,14 +303,16 @@ def summarize(path, label, settle):
         }
     return out
 
-demand = summarize(sys.argv[1], "demand", int(sys.argv[3]))
-p90 = summarize(sys.argv[2], "p90", int(sys.argv[3]))
+settle = int(sys.argv[4])
+demand = summarize(sys.argv[1], "demand", settle)
+p90 = summarize(sys.argv[2], "p90", settle)
+full = summarize(sys.argv[3], "full", settle)
 
-print(f"\n{'mode':6s} {'subcell':8s} {'cpus':>5s} {'borrow%':>8s} {'demand':>7s} {'util_q':>7s} {'need':>6s}")
-for label, res in (("demand", demand), ("p90", p90)):
+print(f"\n{'mode':6s} {'subcell':8s} {'cpus':>5s} {'borrow%':>8s} {'demand':>7s} {'util_q':>7s} {'need':>6s} {'slack':>6s}")
+for label, res in (("demand", demand), ("p90", p90), ("full", full)):
     for name in ("bursty", "steady", "rest"):
         r = res[name]
-        print(f"{label:6s} {name:8s} {r['cpus']:5.0f} {r['borrow_pct']:8.1f} {r['demand']:7.2f} {r['util_q']:7.2f} {r['need']:6.2f}")
+        print(f"{label:6s} {name:8s} {r['cpus']:5.0f} {r['borrow_pct']:8.1f} {r['demand']:7.2f} {r['util_q']:7.2f} {r['need']:6.2f} {res['slack']:6.2f}")
 
 ok = True
 if p90["bursty"]["cpus"] < demand["bursty"]["cpus"] + 1:
@@ -304,7 +321,17 @@ if p90["bursty"]["cpus"] < demand["bursty"]["cpus"] + 1:
 if p90["bursty"]["borrow_pct"] >= demand["bursty"]["borrow_pct"]:
     print("FAIL: quantile sizing did not reduce the bursty subcell's borrowing", file=sys.stderr)
     ok = False
+if p90["slack"] < 0.95:
+    print(f"FAIL: cell with slack in every window measured slack {p90['slack']:.2f}", file=sys.stderr)
+    ok = False
+if not 0.4 <= full["slack"] <= 0.9:
+    print(f"FAIL: cell full during bursts measured slack {full['slack']:.2f}", file=sys.stderr)
+    ok = False
+b = full["bursty"]
+if not b["demand"] + 0.1 < b["need"] < b["util_q"] - 0.1:
+    print(f"FAIL: full cell did not taper bursty's need ({b['demand']:.2f} < {b['need']:.2f} < {b['util_q']:.2f})", file=sys.stderr)
+    ok = False
 sys.exit(0 if ok else 1)
 PY
 
-echo -e "\n${GREEN}PASS${NC}: bursty subcell is sized for its usage quantile"
+echo -e "\n${GREEN}PASS${NC}: bursty subcell is sized for its usage quantile while the cell has slack"

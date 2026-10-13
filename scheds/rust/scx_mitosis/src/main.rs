@@ -119,11 +119,34 @@ fn quantile(samples: &mut [f64], q: f64) -> f64 {
     samples[rank.clamp(1, samples.len()) - 1]
 }
 
-/// CPUs a subcell is sized for: its usage quantile, with the smoothed demand
-/// flow as the floor. Usage is capped by the CPUs a subcell can get, the
-/// demand flow is not, so a subcell short of CPUs keeps asking for them.
-fn subcell_need(smoothed_demand: f64, util_quantile: f64) -> f64 {
-    smoothed_demand.max(util_quantile)
+/// CPUs a subcell is sized for: its smoothed demand plus the headroom its
+/// usage quantile shows above that, scaled by the share of windows in which
+/// its cell had slack. Headroom is only usable in windows with slack, and
+/// usage is capped by the CPUs a subcell can get once the cell is full, so a
+/// full cell falls back to the uncapped demand flow and a subcell short of
+/// CPUs keeps asking for them.
+fn subcell_need(smoothed_demand: f64, util_quantile: f64, slack: f64) -> f64 {
+    smoothed_demand + slack * (util_quantile - smoothed_demand).max(0.0)
+}
+
+/// Idle time a window needs, in CPUs, to count as having slack. Half a CPU
+/// rather than a whole one, so a cell that keeps exactly one CPU free does
+/// not flip on measurement noise.
+const SLACK_IDLE_CPUS: f64 = 0.5;
+
+/// Share of complete windows in which a cell of `cpus` CPUs had at least
+/// SLACK_IDLE_CPUS of idle time, from its usage per window summed over its
+/// subcells. No windows read as all slack.
+fn slack_fraction(cell_window_ns: &[u64], cpus: usize) -> f64 {
+    if cell_window_ns.is_empty() {
+        return 1.0;
+    }
+    let busy_limit = ((cpus as f64 - SLACK_IDLE_CPUS) * UTIL_WINDOW_NS as f64) as u64;
+    let slack = cell_window_ns
+        .iter()
+        .filter(|&&ns| ns <= busy_limit)
+        .count();
+    slack as f64 / cell_window_ns.len() as f64
 }
 
 /// CLOCK_MONOTONIC in ns, the clock BPF attributes utilization windows on.
@@ -441,6 +464,8 @@ struct Scheduler<'a> {
     util_quantile: f64,
     /// That quantile of each subcell's usage over its complete windows (CPUs)
     subcell_util_quantile: [[f64; MAX_SUBCELLS_PER_CELL]; MAX_CELLS],
+    /// Share of complete windows in which each cell had half a CPU idle
+    cell_slack: [f64; MAX_CELLS],
     /// Last time rebalancing was performed
     last_rebalance: Instant,
     /// Number of rebalancing events
@@ -691,6 +716,7 @@ impl<'a> Scheduler<'a> {
             smoothed_subcell_demand: [[0.0; MAX_SUBCELLS_PER_CELL]; MAX_CELLS],
             util_quantile: opts.util_quantile,
             subcell_util_quantile: [[0.0; MAX_SUBCELLS_PER_CELL]; MAX_CELLS],
+            cell_slack: [1.0; MAX_CELLS],
             last_rebalance: Instant::now(),
             rebalance_count: 0,
             epoll,
@@ -889,6 +915,7 @@ impl<'a> Scheduler<'a> {
             self.smoothed_subcell_load[cell_id as usize] = [0.0; MAX_SUBCELLS_PER_CELL];
             self.smoothed_subcell_demand[cell_id as usize] = [0.0; MAX_SUBCELLS_PER_CELL];
             self.subcell_util_quantile[cell_id as usize] = [0.0; MAX_SUBCELLS_PER_CELL];
+            self.cell_slack[cell_id as usize] = 1.0;
         }
 
         let cpu_assignments = self
@@ -1174,6 +1201,7 @@ impl<'a> Scheduler<'a> {
         subcell_need(
             self.smoothed_subcell_demand[cell][subcell],
             self.subcell_util_quantile[cell][subcell],
+            self.cell_slack[cell],
         )
     }
 
@@ -1605,6 +1633,7 @@ impl<'a> Scheduler<'a> {
                 })?;
 
             let cell_metrics = self.metrics.cells.entry(cell as u32).or_default();
+            cell_metrics.slack_fraction = self.cell_slack[cell];
             cell_metrics.update(&stats);
 
             // Raw event counts bypass DistributionStats.
@@ -1923,6 +1952,7 @@ impl<'a> Scheduler<'a> {
 
         if self.enable_rebalancing && self.util_quantile > 0.0 {
             let current_window = monotonic_now_ns()? / UTIL_WINDOW_NS;
+            let mut cell_window_ns: HashMap<usize, Vec<u64>> = HashMap::new();
             for (&(cell, subcell), per_cpu_accounts) in &subcell_accounts {
                 let ring = read_subcell_util_ring(&self.skel, cell, subcell)
                     .context("reading subcell utilization windows")?;
@@ -1930,11 +1960,29 @@ impl<'a> Scheduler<'a> {
                     .iter()
                     .map(|account| (account.util_win, account.util_win_ns))
                     .collect();
-                let mut cpus: Vec<f64> = complete_window_ns(&ring, &open, current_window)
+                let window_ns = complete_window_ns(&ring, &open, current_window);
+                let cell_sums = cell_window_ns
+                    .entry(cell)
+                    .or_insert_with(|| vec![0; window_ns.len()]);
+                for (sum, ns) in cell_sums.iter_mut().zip(&window_ns) {
+                    *sum = sum.saturating_add(*ns);
+                }
+                let mut cpus: Vec<f64> = window_ns
                     .into_iter()
                     .map(|ns| ns as f64 / UTIL_WINDOW_NS as f64)
                     .collect();
                 self.subcell_util_quantile[cell][subcell] = quantile(&mut cpus, self.util_quantile);
+            }
+            for (cell, sums) in cell_window_ns {
+                let nr_cpus = self
+                    .cells
+                    .get(&(cell as u32))
+                    .map_or(0, |cell| cell.cpus.weight());
+                if nr_cpus == 0 {
+                    // Transitional: the applied masks have not been read back yet.
+                    continue;
+                }
+                self.cell_slack[cell] = slack_fraction(&sums, nr_cpus);
             }
         }
 
@@ -2062,6 +2110,7 @@ impl<'a> Scheduler<'a> {
                     subcell_metrics.need = subcell_need(
                         self.smoothed_subcell_demand[cell][subcell],
                         self.subcell_util_quantile[cell][subcell],
+                        self.cell_slack[cell],
                     );
                 }
             }
@@ -2655,8 +2704,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CpuAssignment, Cpumask, NR_UTIL_WINDOWS, Opts, UTIL_TAG_SHIFT, complete_window_ns,
-        quantile, subcell_need, validate_subcell_assignments,
+        CpuAssignment, Cpumask, NR_UTIL_WINDOWS, Opts, UTIL_TAG_SHIFT, UTIL_WINDOW_NS,
+        complete_window_ns, quantile, slack_fraction, subcell_need, validate_subcell_assignments,
     };
     use crate::cell_manager::{CellManager, CpuRecipient};
     use clap::Parser;
@@ -2778,8 +2827,25 @@ mod tests {
         assert_eq!(quantile(&mut samples, 0.8), 0.0);
         assert_eq!(quantile(&mut samples, 1.0), 4.0);
         assert_eq!(quantile(&mut [], 0.9), 0.0);
-        assert_eq!(subcell_need(1.0, 4.0), 4.0);
-        assert_eq!(subcell_need(1.0, 0.5), 1.0);
+    }
+
+    #[test]
+    fn need_tapers_headroom_by_cell_slack() {
+        // Headroom above demand counts in proportion to the windows with
+        // slack; a quantile below demand adds nothing.
+        assert_eq!(subcell_need(1.0, 4.0, 1.0), 4.0);
+        assert_eq!(subcell_need(1.0, 4.0, 0.5), 2.5);
+        assert_eq!(subcell_need(1.0, 4.0, 0.0), 1.0);
+        assert_eq!(subcell_need(1.0, 0.5, 1.0), 1.0);
+
+        // Slack means at least half a CPU's worth of idle time in the window.
+        let w = UTIL_WINDOW_NS;
+        assert_eq!(slack_fraction(&[], 8), 1.0);
+        assert_eq!(
+            slack_fraction(&[7 * w, 8 * w, 0, 7 * w + w / 2 + 1], 8),
+            0.5
+        );
+        assert_eq!(slack_fraction(&[0, w / 2 + 1], 1), 0.5);
     }
 
     #[test]
@@ -2813,8 +2879,10 @@ mod tests {
         assert_eq!(bursty_p90, 4.0);
 
         // Sized by mean demand the bursty subcell gets two CPUs and its
-        // bursts spill onto borrowed ones; sized by need it gets four.
+        // bursts spill onto borrowed ones; sized by need with slack in every
+        // window it gets four. A cell without slack sizes by demand again.
         assert_eq!(split(1.0, 3.0), (2, 5, 1));
-        assert_eq!(split(subcell_need(1.0, bursty_p90), 3.0), (4, 3, 1));
+        assert_eq!(split(subcell_need(1.0, bursty_p90, 1.0), 3.0), (4, 3, 1));
+        assert_eq!(split(subcell_need(1.0, bursty_p90, 0.0), 3.0), (2, 5, 1));
     }
 }
