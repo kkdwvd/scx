@@ -4,10 +4,12 @@
 // GNU General Public License version 2.
 
 use crate::mem_data_src::MemDataSrc;
+use crate::meta::{PERF_MAPS_DIR, PROFILE_META_FILE};
 use crate::record::{
-    HINTS_JSONL_FILE, PERF_MEM_DATA_FILE, PERF_MEM_JSONL_FILE, PERF_MEM_SCRIPT_FIELDS,
-    PERF_MEM_SCRIPT_FILE, PERF_SCHED_DATA_FILE, PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS,
-    PERF_SCHED_SCRIPT_FILE, perf_binary, perf_script_output_exists, report_perf_script_stderr,
+    HINTS_JSONL_FILE, PERF_MEM_DATA_FILE, PERF_MEM_HEADER_FILE, PERF_MEM_JSONL_FILE,
+    PERF_MEM_SCRIPT_FIELDS, PERF_MEM_SCRIPT_FILE, PERF_SCHED_DATA_FILE, PERF_SCHED_HEADER_FILE,
+    PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS, PERF_SCHED_SCRIPT_FILE, perf_binary,
+    perf_script_output_exists, report_perf_script_stderr,
 };
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
@@ -30,6 +32,11 @@ pub struct ProcessOpts {
     /// Print extra information during processing
     #[clap(short, long)]
     pub verbose: bool,
+
+    /// Copy the profile's perf map files (maps/perf-<pid>.map) into /tmp when
+    /// missing there, so perf script can symbolize JIT code recorded elsewhere
+    #[clap(long)]
+    pub install_perf_maps: bool,
 }
 
 /// Represents a single perf mem sample record
@@ -375,6 +382,10 @@ pub fn cmd_process(opts: ProcessOpts) -> Result<()> {
     let output_dir = create_output_dir(&profile_dir)?;
     println!("Output directory: {}", output_dir.display());
 
+    if opts.install_perf_maps {
+        install_perf_maps(&profile_dir)?;
+    }
+
     match run_processing(&profile_dir, &output_dir, opts.verbose) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -411,6 +422,7 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
         );
     }
     copy_hints_if_present(profile_dir, output_dir)?;
+    copy_provenance_if_present(profile_dir, output_dir)?;
     if let Some(mem_perf_script_dst) =
         prepare_trace_script_if_present(profile_dir, output_dir, mem_trace)?
     {
@@ -455,6 +467,65 @@ fn copy_hints_if_present(profile_dir: &Path, output_dir: &Path) -> Result<()> {
             hints_dst.display()
         )
     })?;
+    Ok(())
+}
+
+/// Carry meta.json, the perf headers and the perf map files over to the
+/// processed profile so it stays self-describing.
+fn copy_provenance_if_present(profile_dir: &Path, output_dir: &Path) -> Result<()> {
+    for artifact in [
+        PROFILE_META_FILE,
+        PERF_MEM_HEADER_FILE,
+        PERF_SCHED_HEADER_FILE,
+    ] {
+        let src = profile_dir.join(artifact);
+        if !src.exists() {
+            continue;
+        }
+        let dst = output_dir.join(artifact);
+        create_parent_dir(&dst)?;
+        fs::copy(&src, &dst)
+            .with_context(|| format!("failed to copy {artifact} to '{}'", dst.display()))?;
+    }
+
+    let maps_src = profile_dir.join(PERF_MAPS_DIR);
+    if maps_src.is_dir() {
+        let maps_dst = output_dir.join(PERF_MAPS_DIR);
+        fs::create_dir_all(&maps_dst)
+            .with_context(|| format!("failed to create '{}'", maps_dst.display()))?;
+        for entry in fs::read_dir(&maps_src)
+            .with_context(|| format!("failed to read '{}'", maps_src.display()))?
+        {
+            let entry = entry?;
+            if entry.path().is_file() {
+                fs::copy(entry.path(), maps_dst.join(entry.file_name()))
+                    .with_context(|| format!("failed to copy {}", entry.path().display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn install_perf_maps(profile_dir: &Path) -> Result<()> {
+    let maps_src = profile_dir.join(PERF_MAPS_DIR);
+    if !maps_src.is_dir() {
+        println!("No perf map files in the profile; nothing to install");
+        return Ok(());
+    }
+    let mut installed = 0;
+    for entry in fs::read_dir(&maps_src)
+        .with_context(|| format!("failed to read '{}'", maps_src.display()))?
+    {
+        let entry = entry?;
+        let dst = Path::new("/tmp").join(entry.file_name());
+        if dst.exists() || !entry.path().is_file() {
+            continue;
+        }
+        fs::copy(entry.path(), &dst)
+            .with_context(|| format!("failed to install {}", dst.display()))?;
+        installed += 1;
+    }
+    println!("Installed {installed} perf map file(s) into /tmp");
     Ok(())
 }
 

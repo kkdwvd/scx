@@ -9,6 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 mod extract;
 mod mem_data_src;
+mod meta;
 mod process;
 mod record;
 mod sched_util;

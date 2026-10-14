@@ -6,6 +6,7 @@
 use crate::Context;
 use crate::bpf::{BpfSkel, BpfSkelBuilder};
 use crate::bpf_intf::hints_event;
+use crate::meta::{ProfileMeta, RecordInfo, copy_perf_map_files};
 use anyhow::{Context as _, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
@@ -47,9 +48,11 @@ const SCHED_TRACE_EVENTS: &[&str] = &[
 pub const PERF_MEM_DATA_FILE: &str = "mem/perf.mem.data";
 pub const PERF_MEM_SCRIPT_FILE: &str = "mem/perf.mem.script";
 pub const PERF_MEM_JSONL_FILE: &str = "mem/perf.mem.jsonl";
+pub const PERF_MEM_HEADER_FILE: &str = "mem/perf.mem.header";
 pub const PERF_SCHED_DATA_FILE: &str = "sched/perf.sched.data";
 pub const PERF_SCHED_SCRIPT_FILE: &str = "sched/perf.sched.script";
 pub const PERF_SCHED_JSONL_FILE: &str = "sched/perf.sched.jsonl";
+pub const PERF_SCHED_HEADER_FILE: &str = "sched/perf.sched.header";
 pub const HINTS_JSONL_FILE: &str = "hints/hints.jsonl";
 const DEFAULT_PERF_MMAP_SIZE: &str = "8M";
 const PERF_CLOCKID: &str = "CLOCK_MONOTONIC";
@@ -510,6 +513,24 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
         return Ok(());
     }
 
+    save_profile_meta(&opts, completed)?;
+    for (data_file, header_file) in [
+        (PERF_MEM_DATA_FILE, PERF_MEM_HEADER_FILE),
+        (PERF_SCHED_DATA_FILE, PERF_SCHED_HEADER_FILE),
+    ] {
+        let data_path = opts.output.join(data_file);
+        if data_path.exists()
+            && let Err(e) = save_perf_header(&data_path, &opts.output.join(header_file))
+        {
+            eprintln!("warning: failed to save the perf header of {data_file}: {e}");
+        }
+    }
+    match copy_perf_map_files(&opts.output) {
+        Ok(0) => {}
+        Ok(n) => println!("Copied {n} perf map file(s) into the profile"),
+        Err(e) => eprintln!("warning: failed to copy perf map files: {e}"),
+    }
+
     if opts.enable_perf_script {
         if opts.mode_enabled(RecordMode::Mem) {
             println!("Generating perf.mem.script...");
@@ -676,6 +697,45 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
     drop(hints_recorder);
 
     Ok(completed)
+}
+
+fn save_profile_meta(opts: &RecordOpts, completed: bool) -> Result<()> {
+    let record = RecordInfo {
+        modes: opts
+            .modes
+            .iter()
+            .map(|mode| format!("{mode:?}").to_lowercase())
+            .collect(),
+        timeout_s: opts.timeout,
+        ldlat: opts.ldlat,
+        code_freq_hz: None,
+        completed,
+    };
+    ProfileMeta::collect(record).write(&opts.output)
+}
+
+/// Save `perf script --header-only` for a data file: it records the event
+/// attributes, sample periods and topology the samples were taken with.
+fn save_perf_header(data_path: &Path, header_path: &Path) -> Result<()> {
+    let output = Command::new(perf_binary())
+        .args([
+            "script",
+            "--header-only",
+            "-i",
+            data_path.to_str().context("invalid perf.data path")?,
+        ])
+        .output()
+        .context("failed to run perf script --header-only")?;
+    if !output.status.success() {
+        bail!(
+            "perf script --header-only failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    fs::write(header_path, &output.stdout)
+        .with_context(|| format!("failed to write {}", header_path.display()))?;
+    Ok(())
 }
 
 fn save_perf_version(output_dir: &Path) -> Result<()> {
