@@ -17,7 +17,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
@@ -124,22 +124,76 @@ impl RecordOpts {
     }
 }
 
+/// perf's control channel: commands go down `ctl`, perf answers `ack` on
+/// `ack`. perf is started with --delay=-1 so it only begins sampling on an
+/// explicit enable, once it has finished setting up.
+struct PerfControl {
+    ctl: OwnedFd,
+    ack: OwnedFd,
+}
+
+/// How long to wait for perf to answer a control command. The first answer
+/// comes only after perf has opened its events and synthesized the existing
+/// process maps, which takes seconds on a large host.
+const PERF_CONTROL_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn create_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as RawFd; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        bail!("pipe2 failed: {}", std::io::Error::last_os_error());
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
 struct SpawnedProcess {
     child: Child,
     pidfd: OwnedFd,
     waited: bool,
+    control: Option<PerfControl>,
 }
 
 impl SpawnedProcess {
-    fn spawn(cmd: &[String]) -> Result<Self> {
-        let child = Command::new(&cmd[0])
+    /// Spawn a perf recorder held back by --delay=-1 and attached to a
+    /// control channel, so every recorder can be enabled at the same moment
+    /// once all of them are ready.
+    fn spawn_perf(cmd: &[String]) -> Result<Self> {
+        let (ctl_read, ctl_write) = create_pipe()?;
+        let (ack_read, ack_write) = create_pipe()?;
+        let child_ctl = ctl_read.as_raw_fd();
+        let child_ack = ack_write.as_raw_fd();
+
+        let mut command = Command::new(&cmd[0]);
+        command
             .args(&cmd[1..])
+            .arg("--delay=-1")
+            .arg("--control")
+            .arg(format!("fd:{child_ctl},{child_ack}"))
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("failed to spawn command")?;
+            .stderr(Stdio::inherit());
+        unsafe {
+            command.pre_exec(move || {
+                for fd in [child_ctl, child_ack] {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().context("failed to spawn perf")?;
+        drop(ctl_read);
+        drop(ack_write);
 
+        let mut process = Self::from_child(child)?;
+        process.control = Some(PerfControl {
+            ctl: ctl_write,
+            ack: ack_read,
+        });
+        Ok(process)
+    }
+
+    fn from_child(child: Child) -> Result<Self> {
         let pid = child.id() as i32;
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
         if fd < 0 {
@@ -150,7 +204,100 @@ impl SpawnedProcess {
             child,
             pidfd: unsafe { OwnedFd::from_raw_fd(fd) },
             waited: false,
+            control: None,
         })
+    }
+
+    /// Send a control command and wait for perf to acknowledge it.
+    fn control(&self, shutdown_fd: RawFd, command: &str) -> Result<()> {
+        let control = self
+            .control
+            .as_ref()
+            .context("perf was started without a control channel")?;
+        let line = format!("{command}\n");
+        let written = unsafe {
+            libc::write(
+                control.ctl.as_raw_fd(),
+                line.as_ptr() as *const libc::c_void,
+                line.len(),
+            )
+        };
+        if written != line.len() as isize {
+            bail!(
+                "failed to send '{command}' to perf: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let deadline = Instant::now() + PERF_CONTROL_TIMEOUT;
+        let mut reply = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("perf did not acknowledge '{command}' within {PERF_CONTROL_TIMEOUT:?}");
+            }
+            let mut pollfds = [
+                libc::pollfd {
+                    fd: control.ack.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: shutdown_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.pidfd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let ret = unsafe {
+                libc::poll(
+                    pollfds.as_mut_ptr(),
+                    pollfds.len() as libc::nfds_t,
+                    remaining.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    bail!("interrupted while waiting for perf to acknowledge '{command}'");
+                }
+                bail!("poll failed: {err}");
+            }
+            if pollfds[1].revents & libc::POLLIN != 0 {
+                bail!("interrupted while waiting for perf to acknowledge '{command}'");
+            }
+            if pollfds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                let mut buf = [0u8; 64];
+                let n = unsafe {
+                    libc::read(
+                        control.ack.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n > 0 {
+                    reply.extend_from_slice(&buf[..n as usize]);
+                    if reply.contains(&b'\n') {
+                        return if reply.starts_with(b"ack") {
+                            Ok(())
+                        } else {
+                            bail!(
+                                "perf answered '{command}' with '{}'",
+                                String::from_utf8_lossy(&reply).trim()
+                            )
+                        };
+                    }
+                    continue;
+                }
+            }
+            if pollfds[2].revents & libc::POLLIN != 0 {
+                bail!("perf exited before acknowledging '{command}'");
+            }
+        }
     }
 
     fn pid(&self) -> i32 {
@@ -606,14 +753,24 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
         let perf_data_path = opts.output.join(PERF_MEM_DATA_FILE);
         create_parent_dir(&perf_data_path)?;
         let mem_perf_args = build_mem_perf_args(&perf_data_path, opts.ldlat);
-        processes.push(SpawnedProcess::spawn(&mem_perf_args)?);
+        processes.push(SpawnedProcess::spawn_perf(&mem_perf_args)?);
     }
 
     if sched_trace_enabled {
         let sched_data_path = opts.output.join(PERF_SCHED_DATA_FILE);
         create_parent_dir(&sched_data_path)?;
         let sched_perf_args = build_sched_perf_args(&sched_data_path);
-        processes.push(SpawnedProcess::spawn(&sched_perf_args)?);
+        processes.push(SpawnedProcess::spawn_perf(&sched_perf_args)?);
+    }
+
+    /*
+     * Wait until every perf instance answers, which it only does once its
+     * events are open and the existing process maps are synthesized, then
+     * enable them back to back so the capture windows line up and the
+     * timeout counts recording time rather than perf's start-up.
+     */
+    for process in &processes {
+        process.control(ctx.shutdown_fd(), "ping")?;
     }
 
     let hints_recorder = if hints_trace_enabled {
@@ -631,6 +788,9 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
     };
 
     let mut hints_recorder = hints_recorder;
+    for process in &processes {
+        process.control(ctx.shutdown_fd(), "enable")?;
+    }
     let timeout = Duration::from_secs(opts.timeout);
     let start = Instant::now();
     let mut completed = true;
@@ -648,7 +808,14 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
              */
             stop_hints_recorder(&mut hints_recorder);
             for process in &processes {
-                process.signal(libc::SIGINT);
+                if process.control(ctx.shutdown_fd(), "disable").is_err() {
+                    process.signal(libc::SIGINT);
+                }
+            }
+            for process in &processes {
+                if process.control(ctx.shutdown_fd(), "stop").is_err() {
+                    process.signal(libc::SIGINT);
+                }
             }
             for process in &mut processes {
                 process.wait()?;
