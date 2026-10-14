@@ -1853,8 +1853,8 @@ mod tests {
         let workload = "workload.slice";
 
         let mut groups = HashMap::new();
-        push_samples(&mut groups, allotment, "mcrpxy-webNR1", 0, 4);
-        push_samples(&mut groups, allotment, "mcrpxy-webNR2", 0, 4);
+        push_samples(&mut groups, allotment, "proxyNR1", 0, 4);
+        push_samples(&mut groups, allotment, "proxyNR2", 0, 4);
         push_samples(&mut groups, allotment, "beta", 0, 92);
 
         let group_names = vec![allotment.to_string()];
@@ -1865,20 +1865,18 @@ mod tests {
         let merged = allotment_spec
             .subcells
             .iter()
-            .find(|spec| spec.name == "mcrpxy-webNR")
+            .find(|spec| spec.name == "proxyNR")
             .expect("missing merged numeric-suffix comm subcell");
 
         assert_eq!(
             merged.matches,
-            CellMatches::complex(vec![vec![CellMatch::CommPrefix(
-                "mcrpxy-webNR".to_string()
-            )]])
+            CellMatches::complex(vec![vec![CellMatch::CommPrefix("proxyNR".to_string())]])
         );
         assert!(
             allotment_spec
                 .subcells
                 .iter()
-                .all(|spec| spec.name != "mcrpxy-webNR1" && spec.name != "mcrpxy-webNR2")
+                .all(|spec| spec.name != "proxyNR1" && spec.name != "proxyNR2")
         );
     }
 
@@ -1983,10 +1981,10 @@ mod tests {
         let workload = "workload.slice";
 
         let mut groups = HashMap::new();
-        push_samples(&mut groups, allotment, "mcrpxy-webNR1", 0, 8);
-        push_samples(&mut groups, allotment, "mcrpxy-webNR1", 7, 2);
-        push_samples(&mut groups, allotment, "mcrpxy-webNR2", 7, 8);
-        push_samples(&mut groups, allotment, "mcrpxy-webNR2", 9, 10);
+        push_samples(&mut groups, allotment, "proxyNR1", 0, 8);
+        push_samples(&mut groups, allotment, "proxyNR1", 7, 2);
+        push_samples(&mut groups, allotment, "proxyNR2", 7, 8);
+        push_samples(&mut groups, allotment, "proxyNR2", 9, 10);
         push_samples(&mut groups, allotment, "beta", 0, 72);
 
         let group_names = vec![allotment.to_string()];
@@ -1996,36 +1994,36 @@ mod tests {
         let merged_hint_0 = allotment_spec
             .subcells
             .iter()
-            .find(|spec| spec.name == "mcrpxy-webNR@hint=0")
+            .find(|spec| spec.name == "proxyNR@hint=0")
             .expect("missing merged numeric-suffix hint=0 subcell");
         let merged_hint_7 = allotment_spec
             .subcells
             .iter()
-            .find(|spec| spec.name == "mcrpxy-webNR@hint=7")
+            .find(|spec| spec.name == "proxyNR@hint=7")
             .expect("missing merged numeric-suffix hint=7 subcell");
         let merged_hint_9 = allotment_spec
             .subcells
             .iter()
-            .find(|spec| spec.name == "mcrpxy-webNR@hint=9")
+            .find(|spec| spec.name == "proxyNR@hint=9")
             .expect("missing merged numeric-suffix hint=9 subcell");
         assert_eq!(
             merged_hint_0.matches,
             CellMatches::complex(vec![vec![
-                CellMatch::CommPrefix("mcrpxy-webNR".to_string()),
+                CellMatch::CommPrefix("proxyNR".to_string()),
                 CellMatch::Hint(0),
             ]])
         );
         assert_eq!(
             merged_hint_7.matches,
             CellMatches::complex(vec![vec![
-                CellMatch::CommPrefix("mcrpxy-webNR".to_string()),
+                CellMatch::CommPrefix("proxyNR".to_string()),
                 CellMatch::Hint(7),
             ]])
         );
         assert_eq!(
             merged_hint_9.matches,
             CellMatches::complex(vec![vec![
-                CellMatch::CommPrefix("mcrpxy-webNR".to_string()),
+                CellMatch::CommPrefix("proxyNR".to_string()),
                 CellMatch::Hint(9),
             ]])
         );
@@ -2034,24 +2032,24 @@ mod tests {
     #[test]
     fn mem_extract_summary_groups_numeric_suffix_comms_and_reports_hints() {
         let samples = [
-            sample("mcrpxy-webNR1", "cg", 0),
-            sample("mcrpxy-webNR2", "cg", 7),
-            sample("mcrpxy-webNR3", "cg", 7),
+            sample("proxyNR1", "cg", 0),
+            sample("proxyNR2", "cg", 7),
+            sample("proxyNR3", "cg", 7),
         ];
         let sample_refs: Vec<_> = samples.iter().collect();
         let summary = summarize_comm_groups(&sample_refs);
 
         assert_eq!(summary.len(), 1);
-        assert_eq!(summary[0].name, "mcrpxy-webNR");
+        assert_eq!(summary[0].name, "proxyNR");
         assert_eq!(summary[0].count, 3);
         assert!(summary[0].aggregated_numeric_suffixes);
         assert_eq!(summary[0].hint_counts, vec![(7, 2), (0, 1)]);
         assert_eq!(
             summary[0].concrete_counts,
             vec![
-                ("mcrpxy-webNR1".to_string(), 1),
-                ("mcrpxy-webNR2".to_string(), 1),
-                ("mcrpxy-webNR3".to_string(), 1),
+                ("proxyNR1".to_string(), 1),
+                ("proxyNR2".to_string(), 1),
+                ("proxyNR3".to_string(), 1),
             ]
         );
     }

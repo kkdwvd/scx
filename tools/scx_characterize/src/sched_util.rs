@@ -999,28 +999,27 @@ mod tests {
 
     #[test]
     fn sched_util_auto_adds_zero_hint_category_for_hinted_specs() -> Result<()> {
-        let categories =
-            parse_sched_categories("hhvmworker@hint=256,hhvmworker@hint=640,mcrpxy-*")?;
+        let categories = parse_sched_categories("worker-b@hint=256,worker-b@hint=640,proxy-*")?;
         let names: BTreeSet<_> = categories.iter().map(|cat| cat.name.as_str()).collect();
 
-        assert!(names.contains("hhvmworker@hint=0"));
-        assert!(names.contains("hhvmworker@hint=256"));
-        assert!(names.contains("hhvmworker@hint=640"));
-        assert!(!names.contains("mcrpxy-*@hint=0"));
+        assert!(names.contains("worker-b@hint=0"));
+        assert!(names.contains("worker-b@hint=256"));
+        assert!(names.contains("worker-b@hint=640"));
+        assert!(!names.contains("proxy-*@hint=0"));
 
         Ok(())
     }
 
     #[test]
     fn sched_util_does_not_duplicate_explicit_zero_hint_category() -> Result<()> {
-        let categories = parse_sched_categories("hhvmworker@hint=0,hhvmworker@hint=384")?;
+        let categories = parse_sched_categories("worker-b@hint=0,worker-b@hint=384")?;
         let names: Vec<_> = categories
             .iter()
-            .filter(|cat| cat.name.starts_with("hhvmworker@hint="))
+            .filter(|cat| cat.name.starts_with("worker-b@hint="))
             .map(|cat| cat.name.as_str())
             .collect();
 
-        assert_eq!(names, vec!["hhvmworker@hint=0", "hhvmworker@hint=384"]);
+        assert_eq!(names, vec!["worker-b@hint=0", "worker-b@hint=384"]);
 
         Ok(())
     }
