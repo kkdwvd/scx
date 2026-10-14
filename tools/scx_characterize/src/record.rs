@@ -53,6 +53,10 @@ pub const PERF_SCHED_DATA_FILE: &str = "sched/perf.sched.data";
 pub const PERF_SCHED_SCRIPT_FILE: &str = "sched/perf.sched.script";
 pub const PERF_SCHED_JSONL_FILE: &str = "sched/perf.sched.jsonl";
 pub const PERF_SCHED_HEADER_FILE: &str = "sched/perf.sched.header";
+pub const PERF_CODE_DATA_FILE: &str = "code/perf.code.data";
+pub const PERF_CODE_SCRIPT_FILE: &str = "code/perf.code.script";
+pub const PERF_CODE_JSONL_FILE: &str = "code/perf.code.jsonl";
+pub const PERF_CODE_HEADER_FILE: &str = "code/perf.code.header";
 pub const HINTS_JSONL_FILE: &str = "hints/hints.jsonl";
 const DEFAULT_PERF_MMAP_SIZE: &str = "8M";
 const PERF_CLOCKID: &str = "CLOCK_MONOTONIC";
@@ -65,6 +69,8 @@ pub enum RecordMode {
     Sched,
     /// Record task hint updates into hints/hints.jsonl
     Hints,
+    /// Record user cycles samples with branch stacks into code/perf.code.data
+    Code,
 }
 
 #[derive(Debug, Parser)]
@@ -108,6 +114,10 @@ pub struct RecordOpts {
     /// Size of the hints ring buffer in MB for --mode hints
     #[clap(long, default_value = "8")]
     pub hints_map_ring_sz: u32,
+
+    /// Per-CPU sampling frequency in Hz for --mode code
+    #[clap(long, default_value = "200")]
+    pub code_freq: u64,
 
     /// Disable creating a tar.gz archive after recording
     #[clap(long)]
@@ -600,6 +610,27 @@ fn build_mem_perf_args(mem_data_path: &Path, ldlat: Option<u32>) -> Vec<String> 
     mem_perf_args
 }
 
+fn build_code_perf_args(code_data_path: &Path, freq_hz: u64) -> Vec<String> {
+    vec![
+        perf_binary(),
+        "record".to_string(),
+        "-a".to_string(),
+        "--all-cgroups".to_string(),
+        "-e".to_string(),
+        "cycles:u".to_string(),
+        "-j".to_string(),
+        "any,u".to_string(),
+        "-F".to_string(),
+        freq_hz.to_string(),
+        "-k".to_string(),
+        PERF_CLOCKID.to_string(),
+        "-m".to_string(),
+        DEFAULT_PERF_MMAP_SIZE.to_string(),
+        "-o".to_string(),
+        code_data_path.to_string_lossy().to_string(),
+    ]
+}
+
 fn build_sched_perf_args(sched_data_path: &Path) -> Vec<String> {
     let mut sched_perf_args = vec![
         perf_binary(),
@@ -664,6 +695,7 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
     for (data_file, header_file) in [
         (PERF_MEM_DATA_FILE, PERF_MEM_HEADER_FILE),
         (PERF_SCHED_DATA_FILE, PERF_SCHED_HEADER_FILE),
+        (PERF_CODE_DATA_FILE, PERF_CODE_HEADER_FILE),
     ] {
         let data_path = opts.output.join(data_file);
         if data_path.exists()
@@ -679,27 +711,38 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
     }
 
     if opts.enable_perf_script {
-        if opts.mode_enabled(RecordMode::Mem) {
-            println!("Generating perf.mem.script...");
-            if let Err(e) = generate_perf_script(
-                ctx,
-                &opts.output.join(PERF_MEM_DATA_FILE),
-                &opts.output.join(PERF_MEM_SCRIPT_FILE),
+        for (data_file, script_file, fields, extra_args) in [
+            (
+                PERF_MEM_DATA_FILE,
+                PERF_MEM_SCRIPT_FILE,
                 PERF_MEM_SCRIPT_FIELDS,
-            ) {
-                eprintln!("warning: failed to generate perf.mem.script: {}", e);
+                &[][..],
+            ),
+            (
+                PERF_SCHED_DATA_FILE,
+                PERF_SCHED_SCRIPT_FILE,
+                PERF_SCHED_SCRIPT_FIELDS,
+                &[][..],
+            ),
+            (
+                PERF_CODE_DATA_FILE,
+                PERF_CODE_SCRIPT_FILE,
+                PERF_CODE_SCRIPT_FIELDS,
+                PERF_CODE_SCRIPT_ARGS,
+            ),
+        ] {
+            if !opts.output.join(data_file).exists() {
+                continue;
             }
-        }
-
-        if opts.mode_enabled(RecordMode::Sched) && opts.output.join(PERF_SCHED_DATA_FILE).exists() {
-            println!("Generating perf.sched.script...");
+            println!("Generating {script_file}...");
             if let Err(e) = generate_perf_script(
                 ctx,
-                &opts.output.join(PERF_SCHED_DATA_FILE),
-                &opts.output.join(PERF_SCHED_SCRIPT_FILE),
-                PERF_SCHED_SCRIPT_FIELDS,
+                &opts.output.join(data_file),
+                &opts.output.join(script_file),
+                fields,
+                extra_args,
             ) {
-                eprintln!("warning: failed to generate perf.sched.script: {}", e);
+                eprintln!("warning: failed to generate {script_file}: {e}");
             }
         }
     }
@@ -728,6 +771,9 @@ fn validate_record_opts(opts: &RecordOpts) -> Result<()> {
     if opts.ldlat.is_some() && !opts.mode_enabled(RecordMode::Mem) {
         bail!("--ldlat can only be used with --mode mem");
     }
+    if opts.code_freq == 0 {
+        bail!("--code-freq must be greater than zero");
+    }
     validate_ldlat(opts.ldlat, ibs_ldlat_supported())?;
 
     let hints_trace_enabled = opts.mode_enabled(RecordMode::Hints);
@@ -746,6 +792,7 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
     let mem_trace_enabled = opts.mode_enabled(RecordMode::Mem);
     let sched_trace_enabled = opts.mode_enabled(RecordMode::Sched);
     let hints_trace_enabled = opts.mode_enabled(RecordMode::Hints);
+    let code_trace_enabled = opts.mode_enabled(RecordMode::Code);
 
     let mut processes = Vec::new();
 
@@ -761,6 +808,13 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
         create_parent_dir(&sched_data_path)?;
         let sched_perf_args = build_sched_perf_args(&sched_data_path);
         processes.push(SpawnedProcess::spawn_perf(&sched_perf_args)?);
+    }
+
+    if code_trace_enabled {
+        let code_data_path = opts.output.join(PERF_CODE_DATA_FILE);
+        create_parent_dir(&code_data_path)?;
+        let code_perf_args = build_code_perf_args(&code_data_path, opts.code_freq);
+        processes.push(SpawnedProcess::spawn_perf(&code_perf_args)?);
     }
 
     /*
@@ -875,7 +929,9 @@ fn save_profile_meta(opts: &RecordOpts, completed: bool) -> Result<()> {
             .collect(),
         timeout_s: opts.timeout,
         ldlat: opts.ldlat,
-        code_freq_hz: None,
+        code_freq_hz: opts
+            .mode_enabled(RecordMode::Code)
+            .then_some(opts.code_freq),
         completed,
     };
     ProfileMeta::collect(record).write(&opts.output)
@@ -992,11 +1048,17 @@ pub const PERF_MEM_SCRIPT_FIELDS: &str =
 /// Fields to extract from sched trace perf script output
 pub const PERF_SCHED_SCRIPT_FIELDS: &str = "comm,pid,tid,cpu,time,event,trace";
 
+/// Fields to extract from code trace perf script output. The mmap events
+/// are needed to place the branch addresses inside their dsos.
+pub const PERF_CODE_SCRIPT_FIELDS: &str = "comm,tid,pid,time,cgroup,ip,brstack";
+pub const PERF_CODE_SCRIPT_ARGS: &[&str] = &["--show-mmap-events"];
+
 fn generate_perf_script(
     ctx: &Context,
     perf_data_path: &Path,
     perf_script_path: &Path,
     fields: &str,
+    extra_args: &[&str],
 ) -> Result<()> {
     if !perf_data_path.exists() {
         bail!("perf data file '{}' not found", perf_data_path.display());
@@ -1013,6 +1075,7 @@ fn generate_perf_script(
             "-i",
             perf_data_path.to_str().context("invalid perf.data path")?,
         ])
+        .args(extra_args)
         .stdout(output_file)
         .stderr(Stdio::piped())
         .spawn()

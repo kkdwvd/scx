@@ -7,6 +7,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+mod code_trace;
 mod extract;
 mod mem_data_src;
 mod meta;

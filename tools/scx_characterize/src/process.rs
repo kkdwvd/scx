@@ -3,13 +3,18 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
+use crate::code_trace::{
+    AddressSpaceIndex, CodeSampleRecord, CodeScriptLine, DsoTable, executed_ranges,
+    parse_code_script_line,
+};
 use crate::mem_data_src::MemDataSrc;
 use crate::meta::{PERF_MAPS_DIR, PROFILE_META_FILE};
 use crate::record::{
-    HINTS_JSONL_FILE, PERF_MEM_DATA_FILE, PERF_MEM_HEADER_FILE, PERF_MEM_JSONL_FILE,
-    PERF_MEM_SCRIPT_FIELDS, PERF_MEM_SCRIPT_FILE, PERF_SCHED_DATA_FILE, PERF_SCHED_HEADER_FILE,
-    PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS, PERF_SCHED_SCRIPT_FILE, perf_binary,
-    perf_script_output_exists, report_perf_script_stderr,
+    HINTS_JSONL_FILE, PERF_CODE_DATA_FILE, PERF_CODE_HEADER_FILE, PERF_CODE_JSONL_FILE,
+    PERF_CODE_SCRIPT_ARGS, PERF_CODE_SCRIPT_FIELDS, PERF_CODE_SCRIPT_FILE, PERF_MEM_DATA_FILE,
+    PERF_MEM_HEADER_FILE, PERF_MEM_JSONL_FILE, PERF_MEM_SCRIPT_FIELDS, PERF_MEM_SCRIPT_FILE,
+    PERF_SCHED_DATA_FILE, PERF_SCHED_HEADER_FILE, PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS,
+    PERF_SCHED_SCRIPT_FILE, perf_binary, perf_script_output_exists, report_perf_script_stderr,
 };
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
@@ -139,6 +144,7 @@ struct TraceArtifacts<'a> {
     script_file: &'a str,
     jsonl_file: &'a str,
     script_fields: &'a str,
+    script_args: &'a [&'a str],
     script_kind: &'a str,
     jsonl_kind: &'a str,
 }
@@ -314,6 +320,20 @@ impl HintAssignable for PerfMemRecord {
     }
 }
 
+impl HintAssignable for CodeSampleRecord {
+    fn hint_tid(&self) -> Option<u32> {
+        Some(self.tid)
+    }
+
+    fn hint_time_ns(&self) -> Option<u64> {
+        self.sample_time_ns
+    }
+
+    fn set_hint(&mut self, hint: u64) {
+        self.hint = hint;
+    }
+}
+
 impl HintAssignable for PerfSchedScriptRecord {
     fn hint_tid(&self) -> Option<u32> {
         u32::try_from(self.tid).ok()
@@ -401,6 +421,7 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
         script_file: PERF_MEM_SCRIPT_FILE,
         jsonl_file: PERF_MEM_JSONL_FILE,
         script_fields: PERF_MEM_SCRIPT_FIELDS,
+        script_args: &[],
         script_kind: "perf.mem.script",
         jsonl_kind: "perf.mem.jsonl",
     };
@@ -409,8 +430,18 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
         script_file: PERF_SCHED_SCRIPT_FILE,
         jsonl_file: PERF_SCHED_JSONL_FILE,
         script_fields: PERF_SCHED_SCRIPT_FIELDS,
+        script_args: &[],
         script_kind: "perf.sched.script",
         jsonl_kind: "perf.sched.jsonl",
+    };
+    let code_trace = TraceArtifacts {
+        data_file: PERF_CODE_DATA_FILE,
+        script_file: PERF_CODE_SCRIPT_FILE,
+        jsonl_file: PERF_CODE_JSONL_FILE,
+        script_fields: PERF_CODE_SCRIPT_FIELDS,
+        script_args: PERF_CODE_SCRIPT_ARGS,
+        script_kind: "perf.code.script",
+        jsonl_kind: "perf.code.jsonl",
     };
     let hint_index = HintIndex::load_if_exists(profile_dir)?;
     if let Some(hint_index) = hint_index.as_ref()
@@ -447,6 +478,18 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
         )?;
     }
 
+    if let Some(code_perf_script_dst) =
+        prepare_trace_script_if_present(profile_dir, output_dir, code_trace)?
+    {
+        parse_code_perf_script_to_jsonl(
+            &code_perf_script_dst,
+            &output_dir.join(code_trace.jsonl_file),
+            hint_index.as_ref(),
+            code_trace,
+            verbose,
+        )?;
+    }
+
     print_profile_contents(output_dir)?;
     Ok(())
 }
@@ -477,6 +520,7 @@ fn copy_provenance_if_present(profile_dir: &Path, output_dir: &Path) -> Result<(
         PROFILE_META_FILE,
         PERF_MEM_HEADER_FILE,
         PERF_SCHED_HEADER_FILE,
+        PERF_CODE_HEADER_FILE,
     ] {
         let src = profile_dir.join(artifact);
         if !src.exists() {
@@ -553,7 +597,12 @@ fn prepare_trace_script_if_present(
             "Generating {} from {}...",
             artifacts.script_kind, artifacts.data_file
         );
-        generate_perf_script(&perf_data_src, &perf_script_src, artifacts.script_fields)?;
+        generate_perf_script(
+            &perf_data_src,
+            &perf_script_src,
+            artifacts.script_fields,
+            artifacts.script_args,
+        )?;
     }
 
     println!("Copying {}...", artifacts.script_kind);
@@ -698,6 +747,7 @@ fn generate_perf_script(
     perf_data_path: &Path,
     perf_script_path: &Path,
     fields: &str,
+    extra_args: &[&str],
 ) -> Result<()> {
     if !perf_data_path.exists() {
         bail!("perf data file '{}' not found", perf_data_path.display());
@@ -714,6 +764,7 @@ fn generate_perf_script(
             "-i",
             perf_data_path.to_str().context("invalid perf.data path")?,
         ])
+        .args(extra_args)
         .stdout(Stdio::from(output_file))
         .stderr(Stdio::piped())
         .spawn()
@@ -1095,6 +1146,140 @@ fn parse_perf_mem_script_to_jsonl(
     Ok(())
 }
 
+fn parse_code_perf_script_to_jsonl(
+    perf_script_path: &Path,
+    output_path: &Path,
+    hint_index: Option<&HintIndex>,
+    artifacts: TraceArtifacts<'_>,
+    verbose: bool,
+) -> Result<()> {
+    let file = File::open(perf_script_path)
+        .with_context(|| format!("failed to open {}", artifacts.script_kind))?;
+    let mut reader = BufReader::new(file);
+
+    create_parent_dir(output_path)?;
+    let output_file = File::create(output_path)
+        .with_context(|| format!("failed to create {}", artifacts.jsonl_kind))?;
+    let mut writer = BufWriter::new(output_file);
+
+    let mut address_space = AddressSpaceIndex::default();
+    let mut dsos = DsoTable::default();
+    let mut hint_annotator = hint_index.map(HintAnnotator::new);
+    let mut count = 0u64;
+    let mut mmaps = 0u64;
+    let mut skipped = 0u64;
+    let mut errors = 0u64;
+    let mut ranges_total = 0u64;
+    let mut ranges_unresolved = 0u64;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).context("failed to read line")? == 0 {
+            break;
+        }
+        let raw_line = line.trim_end_matches(['\n', '\r']);
+        match parse_code_script_line(raw_line) {
+            Some(CodeScriptLine::Mmap {
+                pid,
+                start,
+                len,
+                pgoff,
+                exec,
+                path,
+            }) => {
+                if exec {
+                    address_space.insert(pid, start, len, pgoff, &path);
+                    mmaps += 1;
+                }
+            }
+            Some(CodeScriptLine::Sample {
+                comm,
+                pid,
+                tid,
+                time,
+                cgroup,
+                ip,
+                branches,
+            }) => {
+                if comm == "perf" {
+                    skipped += 1;
+                    continue;
+                }
+                let mut exec = Vec::new();
+                for (start, end) in executed_ranges(ip, &branches) {
+                    ranges_total += 1;
+                    let Some((dso, off, len)) = address_space.translate(pid.into(), start, end)
+                    else {
+                        ranges_unresolved += 1;
+                        continue;
+                    };
+                    let (dso_id, dso_record) = dsos.intern(dso);
+                    if let Some(dso_record) = dso_record {
+                        writeln!(writer, "{}", serde_json::to_string(&dso_record)?)?;
+                    }
+                    exec.push((dso_id, off, len));
+                }
+                let (ip_dso, ip_off) = match address_space.resolve(pid.into(), ip) {
+                    Some((dso, off)) => {
+                        let (dso_id, dso_record) = dsos.intern(dso);
+                        if let Some(dso_record) = dso_record {
+                            writeln!(writer, "{}", serde_json::to_string(&dso_record)?)?;
+                        }
+                        (Some(dso_id), Some(off))
+                    }
+                    None => (None, None),
+                };
+                let sample_time_ns = parse_perf_time_ns(&time);
+                let mut record = CodeSampleRecord {
+                    kind: "sample".to_string(),
+                    comm,
+                    tid,
+                    pid,
+                    time,
+                    sample_time_ns,
+                    cgroup,
+                    hint: 0,
+                    ip: format!("{ip:x}"),
+                    ip_dso,
+                    ip_off,
+                    branches: branches.len(),
+                    exec,
+                };
+                if let Some(hint_annotator) = hint_annotator.as_mut() {
+                    hint_annotator.annotate(&mut record);
+                }
+                writeln!(writer, "{}", serde_json::to_string(&record)?)?;
+                count += 1;
+            }
+            Some(CodeScriptLine::Other) => {}
+            None => {
+                if !raw_line.trim().is_empty() {
+                    errors += 1;
+                    if verbose {
+                        eprintln!("unparseable: {}", raw_line);
+                    }
+                }
+            }
+        }
+    }
+
+    writer.flush()?;
+
+    if let Some(ordering_issues) = hint_annotator.and_then(HintAnnotator::finish) {
+        ordering_issues.warn(
+            &perf_script_path.display().to_string(),
+            "Hint lookup fell back conservatively for out-of-order samples.",
+        );
+    }
+
+    println!(
+        "Parsed {} code samples over {} executable mappings ({} skipped, {} unparseable); {} of {} executed ranges did not map to a dso",
+        count, mmaps, skipped, errors, ranges_unresolved, ranges_total
+    );
+
+    Ok(())
+}
+
 fn parse_sched_perf_script_to_jsonl(
     perf_script_path: &Path,
     output_path: &Path,
@@ -1424,6 +1609,7 @@ mod tests {
             script_file: PERF_MEM_SCRIPT_FILE,
             jsonl_file: PERF_MEM_JSONL_FILE,
             script_fields: PERF_MEM_SCRIPT_FIELDS,
+            script_args: &[],
             script_kind: "perf.mem.script",
             jsonl_kind: "perf.mem.jsonl",
         };
