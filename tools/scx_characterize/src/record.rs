@@ -52,7 +52,7 @@ pub const PERF_SCHED_SCRIPT_FILE: &str = "sched/perf.sched.script";
 pub const PERF_SCHED_JSONL_FILE: &str = "sched/perf.sched.jsonl";
 pub const HINTS_JSONL_FILE: &str = "hints/hints.jsonl";
 const DEFAULT_PERF_MMAP_SIZE: &str = "8M";
-const PERF_SCHED_CLOCKID: &str = "CLOCK_MONOTONIC";
+const PERF_CLOCKID: &str = "CLOCK_MONOTONIC";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RecordMode {
@@ -81,9 +81,10 @@ pub struct RecordOpts {
     #[clap(short = 't', long, default_value = "30")]
     pub timeout: u64,
 
-    /// Load latency threshold in cycles
-    #[clap(short = 'l', long, default_value = "10")]
-    pub ldlat: u32,
+    /// Only sample loads whose latency is at least this many cycles (perf mem --ldlat). Off by
+    /// default so the sampled level mix includes cache hits; IBS accepts 128 to 2048 cycles
+    #[clap(short = 'l', long)]
+    pub ldlat: Option<u32>,
 
     /// Trace source to record. Repeat or comma-separate to enable multiple sources
     #[clap(
@@ -402,13 +403,60 @@ fn poll_fds(
     Ok(PollResult::Timeout)
 }
 
+const IBS_LDLAT_CAP_PATH: &str = "/sys/bus/event_source/devices/ibs_op/caps/ldlat";
+const IBS_LDLAT_MIN: u32 = 128;
+const IBS_LDLAT_MAX: u32 = 2048;
+
+fn ibs_ldlat_supported() -> bool {
+    Path::new(IBS_LDLAT_CAP_PATH).exists()
+}
+
+fn validate_ldlat(ldlat: Option<u32>, ibs: bool) -> Result<()> {
+    let Some(ldlat) = ldlat else {
+        return Ok(());
+    };
+    if ldlat == 0 {
+        bail!("--ldlat must be greater than zero; omit it to sample every load");
+    }
+    if ibs && !(IBS_LDLAT_MIN..=IBS_LDLAT_MAX).contains(&ldlat) {
+        bail!(
+            "--ldlat {ldlat} is outside the {IBS_LDLAT_MIN}..={IBS_LDLAT_MAX} cycle range IBS accepts"
+        );
+    }
+    Ok(())
+}
+
+fn build_mem_perf_args(mem_data_path: &Path, ldlat: Option<u32>) -> Vec<String> {
+    let mut mem_perf_args = vec![
+        perf_binary(),
+        "mem".to_string(),
+        "record".to_string(),
+        "--all-cgroups".to_string(),
+        "-p".to_string(),
+        "--data-page-size".to_string(),
+    ];
+    if let Some(ldlat) = ldlat {
+        mem_perf_args.push("--ldlat".to_string());
+        mem_perf_args.push(ldlat.to_string());
+    }
+    mem_perf_args.extend([
+        "-k".to_string(),
+        PERF_CLOCKID.to_string(),
+        "-m".to_string(),
+        format!("{0},{0}", DEFAULT_PERF_MMAP_SIZE),
+        "-o".to_string(),
+        mem_data_path.to_string_lossy().to_string(),
+    ]);
+    mem_perf_args
+}
+
 fn build_sched_perf_args(sched_data_path: &Path) -> Vec<String> {
     let mut sched_perf_args = vec![
         perf_binary(),
         "record".to_string(),
         "-a".to_string(),
         "-k".to_string(),
-        PERF_SCHED_CLOCKID.to_string(),
+        PERF_CLOCKID.to_string(),
         "-m".to_string(),
         DEFAULT_PERF_MMAP_SIZE.to_string(),
         "-o".to_string(),
@@ -509,6 +557,11 @@ fn validate_record_opts(opts: &RecordOpts) -> Result<()> {
         bail!("--file cannot be used with --disable-archive");
     }
 
+    if opts.ldlat.is_some() && !opts.mode_enabled(RecordMode::Mem) {
+        bail!("--ldlat can only be used with --mode mem");
+    }
+    validate_ldlat(opts.ldlat, ibs_ldlat_supported())?;
+
     let hints_trace_enabled = opts.mode_enabled(RecordMode::Hints);
     if hints_trace_enabled && opts.hints_map.is_none() {
         bail!("--mode hints requires --hints-map");
@@ -531,20 +584,7 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
     if mem_trace_enabled {
         let perf_data_path = opts.output.join(PERF_MEM_DATA_FILE);
         create_parent_dir(&perf_data_path)?;
-        let mem_perf_args = vec![
-            perf_binary(),
-            "mem".to_string(),
-            "record".to_string(),
-            "--all-cgroups".to_string(),
-            "-p".to_string(),
-            "--data-page-size".to_string(),
-            "--ldlat".to_string(),
-            opts.ldlat.to_string(),
-            "-m".to_string(),
-            format!("{0},{0}", DEFAULT_PERF_MMAP_SIZE),
-            "-o".to_string(),
-            perf_data_path.to_string_lossy().to_string(),
-        ];
+        let mem_perf_args = build_mem_perf_args(&perf_data_path, opts.ldlat);
         processes.push(SpawnedProcess::spawn(&mem_perf_args)?);
     }
 
@@ -813,12 +853,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ldlat_is_checked_against_the_ibs_range() {
+        assert!(validate_ldlat(None, true).is_ok());
+        assert!(validate_ldlat(Some(128), true).is_ok());
+        assert!(validate_ldlat(Some(2048), true).is_ok());
+        assert!(validate_ldlat(Some(10), true).is_err());
+        assert!(validate_ldlat(Some(4096), true).is_err());
+        assert!(validate_ldlat(Some(10), false).is_ok());
+        assert!(validate_ldlat(Some(0), false).is_err());
+    }
+
+    #[test]
     fn sched_perf_args_use_explicit_monotonic_clock() {
         let args = build_sched_perf_args(Path::new("/tmp/perf.sched.data"));
 
         assert!(
-            args.windows(2)
-                .any(|window| window == ["-k", PERF_SCHED_CLOCKID]),
+            args.windows(2).any(|window| window == ["-k", PERF_CLOCKID]),
             "expected perf record args to include an explicit clockid"
         );
         assert!(
