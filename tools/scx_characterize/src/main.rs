@@ -9,6 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 mod code_trace;
 mod extract;
+mod locality;
 mod mem_data_src;
 mod meta;
 mod process;

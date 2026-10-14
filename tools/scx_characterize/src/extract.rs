@@ -3,6 +3,7 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
+use crate::locality::{ExtractLocalityOpts, cmd_extract_locality};
 use crate::process::PerfMemRecord;
 use crate::sched_util::cmd_extract_sched_util;
 use anyhow::{Context as _, Result, bail};
@@ -135,6 +136,8 @@ pub enum ExtractCommand {
     Mem(ExtractMemOpts),
     /// Extract derived metrics from sched/perf.sched.jsonl
     Sched(ExtractSchedOpts),
+    /// Extract data and code footprints and sharing per thread class
+    Locality(ExtractLocalityOpts),
 }
 
 #[derive(Debug, Parser)]
@@ -1503,6 +1506,7 @@ pub fn cmd_extract(opts: ExtractOpts) -> Result<()> {
     match opts.command {
         ExtractCommand::Mem(opts) => cmd_extract_mem(opts),
         ExtractCommand::Sched(opts) => cmd_extract_sched(opts),
+        ExtractCommand::Locality(opts) => cmd_extract_locality(opts),
     }
 }
 
