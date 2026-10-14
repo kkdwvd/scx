@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 mod extract;
+mod mem_data_src;
 mod process;
 mod record;
 mod sched_util;

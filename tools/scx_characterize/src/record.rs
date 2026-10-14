@@ -760,7 +760,7 @@ pub(crate) fn report_perf_script_stderr(context: &str, stderr: &str) {
 
 /// Fields to extract from perf mem script output
 pub const PERF_MEM_SCRIPT_FIELDS: &str =
-    "comm,tid,pid,time,cgroup,ip,addr,phys_addr,data_page_size,dso,sym";
+    "comm,tid,pid,time,cgroup,ip,addr,phys_addr,data_page_size,data_src,weight,dso,dsoff,sym";
 
 /// Fields to extract from sched trace perf script output
 pub const PERF_SCHED_SCRIPT_FIELDS: &str = "comm,pid,tid,cpu,time,event,trace";

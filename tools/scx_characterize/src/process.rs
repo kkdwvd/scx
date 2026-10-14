@@ -3,6 +3,7 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
+use crate::mem_data_src::MemDataSrc;
 use crate::record::{
     HINTS_JSONL_FILE, PERF_MEM_DATA_FILE, PERF_MEM_JSONL_FILE, PERF_MEM_SCRIPT_FIELDS,
     PERF_MEM_SCRIPT_FILE, PERF_SCHED_DATA_FILE, PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS,
@@ -49,6 +50,27 @@ pub struct PerfMemRecord {
     pub hint: u64,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sample_time_ns: Option<u64>,
+    /// Raw perf_mem_data_src word in hex, when the script carried one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub data_src: Option<String>,
+    /// Decoded operation: load, store, pfetch, exec or na.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mem_op: Option<String>,
+    /// Decoded level that served the access, see `MemDataSrc::lvl`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mem_lvl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mem_hit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mem_remote: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mem_tlb: Option<String>,
+    /// Access latency in cycles as reported in the sample weight.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub weight: Option<u64>,
+    /// Offset of `ip` inside `dso`, when perf printed one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dso_off: Option<u64>,
 }
 
 /// Represents a single sched trace record from perf sched script
@@ -708,11 +730,6 @@ fn parse_page_size(s: &str) -> u64 {
     }
 }
 
-fn parse_u32_pair(part: &str) -> Option<(u32, u32)> {
-    let (first, second) = part.split_once('/')?;
-    Some((first.parse().ok()?, second.parse().ok()?))
-}
-
 fn parse_perf_time_ns(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.is_empty() {
@@ -748,63 +765,71 @@ fn perf_time_f64_to_ns(time: f64) -> Option<u64> {
     Some(ns as u64)
 }
 
+fn mem_line_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"^\s*(?P<comm>.*?)\s+(?P<pid>-?\d+)/(?P<tid>-?\d+)\s+(?P<time>\d+\.\d+):\s+",
+            r"(?P<addr>[0-9a-fA-F]+)\s+",
+            r"(?:(?P<data_src>[0-9a-fA-F]+)\s+\|OP[^|]*\|LVL[^|]*\|SNP[^|]*\|TLB[^|]*\|LCK[^|]*\|BLK\s+(?:[A-Za-z/,]+\s+)?(?P<weight>\d+)\s+)?",
+            r"(?P<cgroup>\S+)\s+(?P<ip>[0-9a-fA-F]+)\s+",
+            r"(?P<sym>.*?)\s*\((?P<dso>[^()]*(?:\([^()]*\)[^()]*)*)\)\s+",
+            r"(?P<phys>[0-9a-fA-F]+)\s+(?P<pgsz>\S+)\s*$",
+        ))
+        .unwrap()
+    })
+}
+
+/// Split a `path+0xoff` dso field as printed with the `dsoff` perf script
+/// field into the path and the offset.
+fn split_dso_offset(dso: &str) -> (String, Option<u64>) {
+    if let Some(idx) = dso.rfind("+0x") {
+        let (path, off) = dso.split_at(idx);
+        if let Ok(off) = u64::from_str_radix(&off[3..], 16) {
+            return (path.to_string(), Some(off));
+        }
+    }
+    (dso.to_string(), None)
+}
+
 fn parse_perf_mem_script_line(line: &str) -> Option<PerfMemRecord> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-
-    let mut iter = line.split_whitespace();
-    let mut comm_parts = Vec::new();
-    let mut pid = None;
-    let mut tid = None;
-    for token in iter.by_ref() {
-        if let Some((parsed_pid, parsed_tid)) = parse_u32_pair(token) {
-            pid = Some(parsed_pid);
-            tid = Some(parsed_tid);
-            break;
-        }
-        comm_parts.push(token);
-    }
-
-    let pid = pid?;
-    let tid = tid?;
-    let time = iter.next()?.trim_end_matches(':').to_string();
+    let caps = mem_line_re().captures(line)?;
+    // perf prints -1 for a thread that exited before the sample was
+    // attributed; keep the line parseable and let the writer skip it.
+    let pid = caps["pid"].parse::<i64>().ok()?.max(0) as u32;
+    let tid = caps["tid"].parse::<i64>().ok()?.max(0) as u32;
+    let time = caps["time"].to_string();
     let sample_time_ns = parse_perf_time_ns(&time);
-    let addr = iter.next()?.to_string();
-    let cgroup = iter.next()?.to_string();
-    let ip = iter.next()?.to_string();
-    let remainder = iter.collect::<Vec<_>>().join(" ");
-
-    let (sym, dso, phys_addr, data_page_size) = if let Some(paren_end) = remainder.rfind(')') {
-        if let Some(paren_start) = remainder[..paren_end].rfind('(') {
-            let sym = remainder[..paren_start].trim().to_string();
-            let dso = remainder[paren_start + 1..paren_end].to_string();
-            let after_dso: Vec<&str> = remainder[paren_end + 1..].split_whitespace().collect();
-            let phys_addr = after_dso.first().map(|s| s.to_string()).unwrap_or_default();
-            let data_page_size = parse_page_size(after_dso.get(1).unwrap_or(&"0"));
-            (sym, dso, phys_addr, data_page_size)
-        } else {
-            (remainder, String::new(), String::new(), 0)
-        }
-    } else {
-        (String::new(), String::new(), String::new(), 0)
-    };
+    let (dso, dso_off) = split_dso_offset(&caps["dso"]);
+    let data_src = caps.name("data_src").map(|m| m.as_str().to_string());
+    let decoded = data_src
+        .as_deref()
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .map(MemDataSrc::decode);
+    let weight = caps.name("weight").and_then(|m| m.as_str().parse().ok());
 
     Some(PerfMemRecord {
-        comm: comm_parts.join(" "),
+        comm: caps["comm"].to_string(),
         tid,
         pid,
         time,
-        addr,
-        cgroup,
-        ip,
-        sym,
+        addr: caps["addr"].to_string(),
+        cgroup: caps["cgroup"].to_string(),
+        ip: caps["ip"].to_string(),
+        sym: caps["sym"].trim().to_string(),
         dso,
-        phys_addr,
-        data_page_size,
+        phys_addr: caps["phys"].to_string(),
+        data_page_size: parse_page_size(&caps["pgsz"]),
         hint: 0,
         sample_time_ns,
+        data_src,
+        mem_op: decoded.as_ref().map(|d| d.op.to_string()),
+        mem_lvl: decoded.as_ref().map(|d| d.lvl.to_string()),
+        mem_hit: decoded.as_ref().and_then(|d| d.hit),
+        mem_remote: decoded.as_ref().map(|d| d.remote),
+        mem_tlb: decoded.as_ref().map(|d| d.tlb.to_string()),
+        weight,
+        dso_off,
     })
 }
 
@@ -945,10 +970,14 @@ fn parse_perf_mem_script_to_jsonl(
         let raw_line = line.trim_end_matches(['\n', '\r']);
         match parse_perf_mem_script_line(raw_line) {
             Some(mut record) => {
-                if record.phys_addr == "0" || record.phys_addr.is_empty() {
+                if record.tid == 0
+                    || record.addr == "0"
+                    || record.phys_addr == "0"
+                    || record.phys_addr.is_empty()
+                {
                     skipped += 1;
                     if verbose {
-                        eprintln!("skipped (no phys_addr): {}", raw_line);
+                        eprintln!("skipped (no thread or data address): {}", raw_line);
                     }
                     continue;
                 }
@@ -1152,6 +1181,63 @@ mod tests {
         assert_eq!(record.pid, 1000);
         assert_eq!(record.tid, 2001);
         assert_eq!(record.sample_time_ns, Some(50));
+    }
+
+    #[test]
+    fn parse_perf_mem_line_keeps_data_source_latency_and_dso_offset() {
+        let line = "            perf  515039/515039  357681.237418: ffa00000cefcfdc0       229080142 |OP LOAD|LVL L1 hit|SNP N/A|TLB L1 hit|LCK N/A|BLK  N/A              12 /user.slice/run.scope ffffffff82039964 __bitmap_and (/boot/vmlinux-7.1.3+0x1239964)      2f4cb0fdc0 4K";
+        let record = parse_perf_mem_script_line(line).expect("expected mem record to parse");
+
+        assert_eq!(record.comm, "perf");
+        assert_eq!(record.addr, "ffa00000cefcfdc0");
+        assert_eq!(record.cgroup, "/user.slice/run.scope");
+        assert_eq!(record.ip, "ffffffff82039964");
+        assert_eq!(record.sym, "__bitmap_and");
+        assert_eq!(record.dso, "/boot/vmlinux-7.1.3");
+        assert_eq!(record.dso_off, Some(0x1239964));
+        assert_eq!(record.phys_addr, "2f4cb0fdc0");
+        assert_eq!(record.data_page_size, 4096);
+        assert_eq!(record.data_src.as_deref(), Some("229080142"));
+        assert_eq!(record.mem_op.as_deref(), Some("load"));
+        assert_eq!(record.mem_lvl.as_deref(), Some("l1"));
+        assert_eq!(record.mem_hit, Some(true));
+        assert_eq!(record.mem_remote, Some(false));
+        assert_eq!(record.mem_tlb.as_deref(), Some("l1"));
+        assert_eq!(record.weight, Some(12));
+    }
+
+    #[test]
+    fn parse_perf_mem_line_handles_odd_lines() {
+        // An empty BLK field, a root cgroup and a remote cache hit.
+        let line = "         swapper       0/0       357681.249052: ff110001073b5e50     83649808042 |OP LOAD|LVL Remote core, same node Any cache hit|SNP HitM|TLB L2 hit|LCK N/A|BLK              551 / ffffffff8228142b __update_load_avg_cfs_rq (/boot/vmlinux-7.1.3+0x148142b)       1073b5e50 4K";
+        let record = parse_perf_mem_script_line(line).expect("expected mem record to parse");
+        assert_eq!(record.cgroup, "/");
+        assert_eq!(record.weight, Some(551));
+        assert_eq!(record.mem_lvl.as_deref(), Some("any_cache"));
+        assert_eq!(record.mem_remote, Some(true));
+
+        // A deleted dso and an unknown symbol.
+        let line = "  worker 2979442/509664  357682.124516: 7fac0000 229080142 |OP LOAD|LVL L1 hit|SNP N/A|TLB N/A|LCK N/A|BLK  N/A 0 /workload.slice/svc.service     7fac61bab230 [unknown] (/usr/local/lib/libc.so.6 (deleted)) 1234000 4K";
+        let record = parse_perf_mem_script_line(line).expect("expected mem record to parse");
+        assert_eq!(record.sym, "[unknown]");
+        assert_eq!(record.dso, "/usr/local/lib/libc.so.6 (deleted)");
+        assert_eq!(record.phys_addr, "1234000");
+
+        // A symbol with parentheses and a store.
+        let line = "worker 10/11 1.000000000: 7f00 229080144 |OP STORE|LVL L1 hit|SNP N/A|TLB N/A|LCK N/A|BLK  N/A 0 /cg 4000 std::vector<int>::push_back(int const&) (/usr/lib/libfoo.so+0x1a2b) 3000 4K";
+        let record = parse_perf_mem_script_line(line).expect("expected mem record to parse");
+        assert_eq!(record.sym, "std::vector<int>::push_back(int const&)");
+        assert_eq!(record.dso_off, Some(0x1a2b));
+        assert_eq!(record.mem_op.as_deref(), Some("store"));
+
+        // A script without the data source fields.
+        let record = parse_perf_mem_script_line(
+            "alpha worker 1000/2001 0.000000050: 1 /cg 2 foo (bar.so) 3 4K",
+        )
+        .expect("expected mem record to parse");
+        assert_eq!(record.dso, "bar.so");
+        assert_eq!(record.data_src, None);
+        assert_eq!(record.weight, None);
     }
 
     #[test]
