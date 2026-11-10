@@ -1,0 +1,14 @@
+=== unfixed-7: 7.0.0-42-generic, 16 cpus, layered args: 
+t= 5 wakes=5037 gaps(>1s)=0 max_gap_ms=12.124
+t=10 wakes=10104 gaps(>1s)=0 max_gap_ms=12.124
+t=20 wakes=20293 gaps(>1s)=0 max_gap_ms=12.124
+t=30 wakes=26209 gaps(>1s)=0 max_gap_ms=12.124
+t=40 wakes=26209 gaps(>1s)=0 max_gap_ms=12.124
+RESULT wakes=28560 gaps(>1s)=1 max_gap_ms=16878.607
+SCHED: still attached at the end (enabled)
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+--- drain stats (last report)

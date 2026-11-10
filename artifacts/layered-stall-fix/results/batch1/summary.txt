@@ -1,0 +1,14 @@
+unfixed-1: wakes=30163 late(>1s)=0 max_lat_ms=6.451 | antistall=0 | no watchdog abort
+unfixed-2: wakes=30564 late(>1s)=0 max_lat_ms=3.978 | antistall=0 | no watchdog abort
+unfixed-3: wakes=30716 late(>1s)=0 max_lat_ms=4.591 | antistall=0 | no watchdog abort
+unfixed-4: wakes=1986 late(>1s)=1 max_lat_ms=41866.695 | antistall=0 | runnable task stall (drn-mig[340] failed to run for 41.866s) | LAYER[0](drn)-DSQ[2] nr_queued=1 -41865ms | LAYER[0](drn) CPUS=0000001e
+unfixed-5: wakes=1442 late(>1s)=1 max_lat_ms=42649.939 | antistall=0 | runnable task stall (drn-mig[343] failed to run for 42.648s) | LAYER[0](drn)-DSQ[2] nr_queued=1 -42648ms | LAYER[0](drn) CPUS=0000001e
+unfixed-6: wakes=1935 late(>1s)=1 max_lat_ms=41895.579 | antistall=0 | runnable task stall (drn-mig[338] failed to run for 41.895s) | LAYER[0](drn)-DSQ[3] nr_queued=1 -41894ms | LAYER[0](drn) CPUS=0000001e
+TOTAL unfixed: 6 runs, 3 watchdog aborts, 0 runs with a gap over 1s
+fixed-1: wakes=30208 late(>1s)=0 max_lat_ms=13.967 | antistall=0 | no watchdog abort
+fixed-2: wakes=30706 late(>1s)=0 max_lat_ms=5.331 | antistall=0 | no watchdog abort
+fixed-3: wakes=30416 late(>1s)=0 max_lat_ms=14.619 | antistall=0 | no watchdog abort
+fixed-4: wakes=30310 late(>1s)=0 max_lat_ms=3.859 | antistall=0 | no watchdog abort
+fixed-5: wakes=30564 late(>1s)=0 max_lat_ms=14.326 | antistall=0 | no watchdog abort
+fixed-6: wakes=30362 late(>1s)=0 max_lat_ms=4.377 | antistall=0 | no watchdog abort
+TOTAL fixed: 6 runs, 0 watchdog aborts, 0 runs with a gap over 1s

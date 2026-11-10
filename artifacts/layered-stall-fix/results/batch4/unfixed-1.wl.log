@@ -1,0 +1,46 @@
+t= 1 wakes=1020 late(>1s)=0 max_lat_ms=0.267
+t= 2 wakes=2029 late(>1s)=0 max_lat_ms=0.267
+t= 3 wakes=3043 late(>1s)=0 max_lat_ms=0.305
+t= 4 wakes=4038 late(>1s)=0 max_lat_ms=0.305
+t= 5 wakes=5045 late(>1s)=0 max_lat_ms=3.937
+t= 6 wakes=6069 late(>1s)=0 max_lat_ms=3.937
+t= 7 wakes=7094 late(>1s)=0 max_lat_ms=3.937
+t= 8 wakes=8119 late(>1s)=0 max_lat_ms=3.937
+t= 9 wakes=9145 late(>1s)=0 max_lat_ms=3.937
+t=10 wakes=10172 late(>1s)=0 max_lat_ms=3.937
+t=11 wakes=11196 late(>1s)=0 max_lat_ms=3.937
+t=12 wakes=12219 late(>1s)=0 max_lat_ms=3.937
+t=13 wakes=13238 late(>1s)=0 max_lat_ms=3.937
+t=14 wakes=14263 late(>1s)=0 max_lat_ms=3.937
+t=15 wakes=15286 late(>1s)=0 max_lat_ms=3.937
+t=16 wakes=16310 late(>1s)=0 max_lat_ms=3.937
+t=17 wakes=17333 late(>1s)=0 max_lat_ms=3.937
+t=18 wakes=18349 late(>1s)=0 max_lat_ms=3.937
+t=19 wakes=19364 late(>1s)=0 max_lat_ms=3.937
+t=20 wakes=20391 late(>1s)=0 max_lat_ms=3.937
+t=21 wakes=21416 late(>1s)=0 max_lat_ms=3.937
+t=22 wakes=22440 late(>1s)=0 max_lat_ms=3.937
+t=23 wakes=23469 late(>1s)=0 max_lat_ms=3.937
+t=24 wakes=24493 late(>1s)=0 max_lat_ms=3.937
+t=25 wakes=25516 late(>1s)=0 max_lat_ms=3.937
+t=26 wakes=26538 late(>1s)=0 max_lat_ms=3.937
+t=27 wakes=27561 late(>1s)=0 max_lat_ms=3.937
+t=28 wakes=28586 late(>1s)=0 max_lat_ms=3.937
+t=29 wakes=29606 late(>1s)=0 max_lat_ms=3.937
+t=30 wakes=30625 late(>1s)=0 max_lat_ms=3.937
+t=31 wakes=31646 late(>1s)=0 max_lat_ms=3.937
+t=32 wakes=32667 late(>1s)=0 max_lat_ms=3.937
+t=33 wakes=33688 late(>1s)=0 max_lat_ms=3.937
+t=34 wakes=34712 late(>1s)=0 max_lat_ms=3.937
+t=35 wakes=35733 late(>1s)=0 max_lat_ms=3.937
+t=36 wakes=36757 late(>1s)=0 max_lat_ms=3.937
+t=37 wakes=37780 late(>1s)=0 max_lat_ms=3.937
+t=38 wakes=38804 late(>1s)=0 max_lat_ms=3.937
+t=39 wakes=39823 late(>1s)=0 max_lat_ms=3.937
+t=40 wakes=40845 late(>1s)=0 max_lat_ms=3.937
+t=41 wakes=41868 late(>1s)=0 max_lat_ms=3.937
+t=42 wakes=42892 late(>1s)=0 max_lat_ms=3.937
+t=43 wakes=43915 late(>1s)=0 max_lat_ms=3.937
+t=44 wakes=44955 late(>1s)=0 max_lat_ms=3.937
+t=45 wakes=46016 late(>1s)=0 max_lat_ms=3.937
+RESULT wakes=46017 late(>1s)=0 max_lat_ms=3.937

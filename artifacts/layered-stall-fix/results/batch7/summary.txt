@@ -1,0 +1,18 @@
+unfixed-1: wakes=46014 gaps(>1s)=1 max_gap_ms=12715.632 | antistall=1 | no watchdog abort
+unfixed-2: wakes=45871 gaps(>1s)=1 max_gap_ms=12863.261 | antistall=1 | no watchdog abort
+unfixed-3: wakes=45763 gaps(>1s)=0 max_gap_ms=32.651 | antistall=0 | no watchdog abort
+unfixed-4: wakes=45813 gaps(>1s)=2 max_gap_ms=13002.969 | antistall=1 | no watchdog abort
+unfixed-5: wakes=34739 gaps(>1s)=1 max_gap_ms=10995.104 | antistall=1 | no watchdog abort
+unfixed-6: wakes=45492 gaps(>1s)=0 max_gap_ms=11.425 | antistall=0 | no watchdog abort
+unfixed-7: wakes=28560 gaps(>1s)=1 max_gap_ms=16878.607 | antistall=1 | no watchdog abort
+unfixed-8: wakes=45883 gaps(>1s)=2 max_gap_ms=12932.241 | antistall=2 | no watchdog abort
+TOTAL unfixed: 8 runs, 0 watchdog aborts, 6 runs with a gap over 1s
+fixed-1: wakes=45779 gaps(>1s)=0 max_gap_ms=11.083 | antistall=0 | no watchdog abort
+fixed-2: wakes=45584 gaps(>1s)=0 max_gap_ms=14.116 | antistall=0 | no watchdog abort
+fixed-3: wakes=45967 gaps(>1s)=0 max_gap_ms=9.597 | antistall=0 | no watchdog abort
+fixed-4: wakes=45808 gaps(>1s)=0 max_gap_ms=12.268 | antistall=0 | no watchdog abort
+fixed-5: wakes=45939 gaps(>1s)=0 max_gap_ms=26.793 | antistall=0 | no watchdog abort
+fixed-6: wakes=45922 gaps(>1s)=0 max_gap_ms=15.673 | antistall=0 | no watchdog abort
+fixed-7: wakes=45885 gaps(>1s)=0 max_gap_ms=12.749 | antistall=0 | no watchdog abort
+fixed-8: wakes=45205 gaps(>1s)=0 max_gap_ms=15.471 | antistall=0 | no watchdog abort
+TOTAL fixed: 8 runs, 0 watchdog aborts, 0 runs with a gap over 1s

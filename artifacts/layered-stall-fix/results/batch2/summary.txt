@@ -1,0 +1,14 @@
+unfixed-1: wakes=30957 late(>1s)=0 max_lat_ms=11.702 | antistall=0 | no watchdog abort
+unfixed-2: wakes=31783 late(>1s)=0 max_lat_ms=8.129 | antistall=0 | no watchdog abort
+unfixed-3: wakes=31735 late(>1s)=0 max_lat_ms=10.202 | antistall=0 | no watchdog abort
+unfixed-4: wakes=31745 late(>1s)=0 max_lat_ms=5.715 | antistall=0 | no watchdog abort
+unfixed-5: wakes=31301 late(>1s)=0 max_lat_ms=5.851 | antistall=0 | no watchdog abort
+unfixed-6: wakes=31079 late(>1s)=0 max_lat_ms=10.617 | antistall=0 | no watchdog abort
+TOTAL unfixed: 6 runs, 0 watchdog aborts, 0 runs with a gap over 1s
+fixed-1: wakes=31702 late(>1s)=0 max_lat_ms=10.183 | antistall=0 | no watchdog abort
+fixed-2: wakes=31668 late(>1s)=0 max_lat_ms=1.444 | antistall=0 | no watchdog abort
+fixed-3: wakes=31464 late(>1s)=0 max_lat_ms=3.854 | antistall=0 | no watchdog abort
+fixed-4: wakes=31779 late(>1s)=0 max_lat_ms=9.154 | antistall=0 | no watchdog abort
+fixed-5: wakes=31746 late(>1s)=0 max_lat_ms=6.685 | antistall=0 | no watchdog abort
+fixed-6: wakes=31296 late(>1s)=0 max_lat_ms=6.714 | antistall=0 | no watchdog abort
+TOTAL fixed: 6 runs, 0 watchdog aborts, 0 runs with a gap over 1s

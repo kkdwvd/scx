@@ -1,0 +1,14 @@
+=== fixed-3: 7.0.0-42-generic, 16 cpus, layered args: --disable-antistall
+t= 5 wakes=5004 late(>1s)=0 max_lat_ms=1.267
+t=10 wakes=10091 late(>1s)=0 max_lat_ms=3.161
+t=20 wakes=20285 late(>1s)=0 max_lat_ms=3.161
+t=30 wakes=30496 late(>1s)=0 max_lat_ms=3.161
+t=40 wakes=40729 late(>1s)=0 max_lat_ms=3.161
+RESULT wakes=45855 late(>1s)=0 max_lat_ms=3.161
+SCHED: still attached at the end (enabled)
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+--- drain stats (last report)

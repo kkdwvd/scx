@@ -1,0 +1,18 @@
+unfixed-1: wakes=46017 late(>1s)=0 max_lat_ms=3.937 | antistall=0 | runnable task stall (drn-hog[340] failed to run for 43.440s) | LAYER[0](drn)-DSQ[0] nr_queued=2 -43486ms;LAYER[0](drn)-DSQ[1] nr_queued=1 -43486ms;LAYER[0](drn)-DSQ[2] nr_queued=1 -43486ms | LAYER[0](drn) CPUS=0000001e
+unfixed-2: wakes=45981 late(>1s)=0 max_lat_ms=6.051 | antistall=0 | no watchdog abort
+unfixed-3: wakes=46112 late(>1s)=0 max_lat_ms=5.492 | antistall=0 | runnable task stall (drn-hog[335] failed to run for 43.846s) | LAYER[0](drn)-DSQ[0] nr_queued=2 -43869ms;LAYER[0](drn)-DSQ[1] nr_queued=1 -43869ms;LAYER[0](drn)-DSQ[2] nr_queued=1 -43869ms | LAYER[0](drn) CPUS=0000001e
+unfixed-4: wakes=45792 late(>1s)=0 max_lat_ms=6.057 | antistall=0 | runnable task stall (drn-hog[338] failed to run for 43.668s) | LAYER[0](drn)-DSQ[0] nr_queued=1 -43702ms;LAYER[0](drn)-DSQ[1] nr_queued=2 -43702ms;LAYER[0](drn)-DSQ[2] nr_queued=1 -43701ms | LAYER[0](drn) CPUS=0000001e
+unfixed-5: wakes=45775 late(>1s)=0 max_lat_ms=7.176 | antistall=0 | runnable task stall (drn-hog[335] failed to run for 43.659s) | LAYER[0](drn)-DSQ[0] nr_queued=3 -43660ms;LAYER[0](drn)-DSQ[2] nr_queued=1 -43661ms | LAYER[0](drn) CPUS=0000001e
+unfixed-6: wakes=45796 late(>1s)=0 max_lat_ms=9.894 | antistall=0 | runnable task stall (drn-hog[331] failed to run for 43.618s) | LAYER[0](drn)-DSQ[0] nr_queued=1 -43701ms;LAYER[0](drn)-DSQ[1] nr_queued=2 -43701ms;LAYER[0](drn)-DSQ[3] nr_queued=1 -43701ms | LAYER[0](drn) CPUS=0000001e
+unfixed-7: wakes=2901 late(>1s)=1 max_lat_ms=42160.993 | antistall=0 | runnable task stall (drn-hog[338] failed to run for 43.956s) | LAYER[0](drn)-DSQ[0] nr_queued=4 -43956ms;LAYER[0](drn)-DSQ[2] nr_queued=1 -43956ms;LAYER[0](drn)-DSQ[3] nr_queued=1 -42159ms | LAYER[0](drn) CPUS=0000001e
+unfixed-8: wakes=45625 late(>1s)=0 max_lat_ms=9.609 | antistall=0 | no watchdog abort
+TOTAL unfixed: 8 runs, 6 watchdog aborts, 0 runs with a gap over 1s
+fixed-1: wakes=45995 late(>1s)=0 max_lat_ms=4.366 | antistall=0 | no watchdog abort
+fixed-2: wakes=45885 late(>1s)=0 max_lat_ms=3.445 | antistall=0 | no watchdog abort
+fixed-3: wakes=45903 late(>1s)=0 max_lat_ms=8.838 | antistall=0 | no watchdog abort
+fixed-4: wakes=45890 late(>1s)=0 max_lat_ms=3.597 | antistall=0 | no watchdog abort
+fixed-5: wakes=45847 late(>1s)=0 max_lat_ms=3.814 | antistall=0 | no watchdog abort
+fixed-6: wakes=45342 late(>1s)=0 max_lat_ms=6.076 | antistall=0 | no watchdog abort
+fixed-7: wakes=45961 late(>1s)=0 max_lat_ms=5.191 | antistall=0 | no watchdog abort
+fixed-8: wakes=45828 late(>1s)=0 max_lat_ms=8.233 | antistall=0 | no watchdog abort
+TOTAL fixed: 8 runs, 0 watchdog aborts, 0 runs with a gap over 1s

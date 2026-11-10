@@ -1,0 +1,46 @@
+t= 1 wakes=976 gaps(>1s)=0 max_gap_ms=12.662
+t= 2 wakes=1964 gaps(>1s)=1 max_gap_ms=1733.447
+t= 3 wakes=2982 gaps(>1s)=1 max_gap_ms=1733.447
+t= 4 wakes=3991 gaps(>1s)=1 max_gap_ms=1733.447
+t= 5 wakes=5012 gaps(>1s)=1 max_gap_ms=1733.447
+t= 6 wakes=6033 gaps(>1s)=1 max_gap_ms=1733.447
+t= 7 wakes=7055 gaps(>1s)=1 max_gap_ms=1733.447
+t= 8 wakes=8075 gaps(>1s)=1 max_gap_ms=1733.447
+t= 9 wakes=9094 gaps(>1s)=1 max_gap_ms=1733.447
+t=10 wakes=10112 gaps(>1s)=1 max_gap_ms=1733.447
+t=11 wakes=11132 gaps(>1s)=1 max_gap_ms=1733.447
+t=12 wakes=12148 gaps(>1s)=1 max_gap_ms=1733.447
+t=13 wakes=13167 gaps(>1s)=1 max_gap_ms=1733.447
+t=14 wakes=14188 gaps(>1s)=2 max_gap_ms=13002.969
+t=15 wakes=15209 gaps(>1s)=2 max_gap_ms=13002.969
+t=16 wakes=16224 gaps(>1s)=2 max_gap_ms=13002.969
+t=17 wakes=17247 gaps(>1s)=2 max_gap_ms=13002.969
+t=18 wakes=18268 gaps(>1s)=2 max_gap_ms=13002.969
+t=19 wakes=19290 gaps(>1s)=2 max_gap_ms=13002.969
+t=20 wakes=20311 gaps(>1s)=2 max_gap_ms=13002.969
+t=21 wakes=21331 gaps(>1s)=2 max_gap_ms=13002.969
+t=22 wakes=22350 gaps(>1s)=2 max_gap_ms=13002.969
+t=23 wakes=23374 gaps(>1s)=2 max_gap_ms=13002.969
+t=24 wakes=24398 gaps(>1s)=2 max_gap_ms=13002.969
+t=25 wakes=25420 gaps(>1s)=2 max_gap_ms=13002.969
+t=26 wakes=26444 gaps(>1s)=2 max_gap_ms=13002.969
+t=27 wakes=27467 gaps(>1s)=2 max_gap_ms=13002.969
+t=28 wakes=28494 gaps(>1s)=2 max_gap_ms=13002.969
+t=29 wakes=29515 gaps(>1s)=2 max_gap_ms=13002.969
+t=30 wakes=30536 gaps(>1s)=2 max_gap_ms=13002.969
+t=31 wakes=31558 gaps(>1s)=2 max_gap_ms=13002.969
+t=32 wakes=32578 gaps(>1s)=2 max_gap_ms=13002.969
+t=33 wakes=33597 gaps(>1s)=2 max_gap_ms=13002.969
+t=34 wakes=34619 gaps(>1s)=2 max_gap_ms=13002.969
+t=35 wakes=35636 gaps(>1s)=2 max_gap_ms=13002.969
+t=36 wakes=36656 gaps(>1s)=2 max_gap_ms=13002.969
+t=37 wakes=37678 gaps(>1s)=2 max_gap_ms=13002.969
+t=38 wakes=38699 gaps(>1s)=2 max_gap_ms=13002.969
+t=39 wakes=39719 gaps(>1s)=2 max_gap_ms=13002.969
+t=40 wakes=40737 gaps(>1s)=2 max_gap_ms=13002.969
+t=41 wakes=41756 gaps(>1s)=2 max_gap_ms=13002.969
+t=42 wakes=42777 gaps(>1s)=2 max_gap_ms=13002.969
+t=43 wakes=43800 gaps(>1s)=2 max_gap_ms=13002.969
+t=44 wakes=44805 gaps(>1s)=2 max_gap_ms=13002.969
+t=45 wakes=45812 gaps(>1s)=2 max_gap_ms=13002.969
+RESULT wakes=45813 gaps(>1s)=2 max_gap_ms=13002.969

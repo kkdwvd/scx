@@ -1,0 +1,202 @@
+[2m2026-11-09T23:55:22.897297Z[0m [32m INFO[0m ThreadId(01) [2mscx_layered[0m[2m:[0m [2mscheds/rust/scx_layered/src/main.rs[0m[2m:[0m[2m2687:[0m Topology awareness not specified, selecting enabled based on hardware
+[2m2026-11-09T23:55:22.900272Z[0m [32m INFO[0m ThreadId(01) [2mscx_layered[0m[2m:[0m [2mscheds/rust/scx_layered/src/lib.rs[0m[2m:[0m[2m162:[0m CPUs: online/possible=16/16 nr_cores=16
+[2m2026-11-09T23:55:22.946832Z[0m [32m INFO[0m ThreadId(01) [2mscx_layered[0m[2m:[0m [2mscheds/rust/scx_layered/src/main.rs[0m[2m:[0m[2m2803:[0m Running scx_layered (build ID: 1.1.4 x86_64-unknown-linux-gnu/debug)
+[2m2026-11-09T23:55:22.997598Z[0m [32m INFO[0m ThreadId(01) [2mscx_utils::compat[0m[2m:[0m [2mrust/scx_utils/src/compat.rs[0m[2m:[0m[2m572:[0m kernel features: arena_fetch_bitops=no prog_stream_fds=no
+[2m2026-11-09T23:55:23.895403Z[0m [32m INFO[0m ThreadId(03) [2mscx_utils::misc[0m[2m:[0m [2mrust/scx_utils/src/misc.rs[0m[2m:[0m[2m53:[0m Stats server not available, retrying...
+[2m2026-11-09T23:55:24.858706Z[0m [32m INFO[0m ThreadId(01) [2mscx_layered[0m[2m:[0m [2mscheds/rust/scx_layered/src/main.rs[0m[2m:[0m[2m3116:[0m Layered Scheduler Attached. Run `scx_layered --monitor` for metrics.
+━━ Tue, 10 Nov 2026 00:55:24 +0100 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tot=     19 local_sel/enq=63.2/15.8 open_idle=0.00 affn_viol=0.00 hi/lo=0.00/0.00
+busy=  0.0 util/hi/lo=    0.5/0.00/0.00 fb_cpus=[0]/util= 0.0 proc=0ms sys_util_10s=  0.0
+excl_coll=0.00 excl_preempt=0.00 excl_idle=0.00 excl_wakeup=0.00
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+gpu_tasks_affinitized=0 gpu_task_affinitization_time=0
+
+▶ drn ─ util/open/frac=   0.0/0.00/    0.0 prot/prot_preempt=0.00/0.00 tasks=     0
+  sched   tot=    0  dd_sel/enq=0.00/0.00 dsq/10s=0.00/0.00 wake/exp/re=0.00/0.00/0.00
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign=0.00/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=0.00 xnuma=0.00 xllc/skip=0.00/0.00 open_idle=0.00 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.00/0.00 llc_drain/try=0.00/0.00 skip_rnode=0.00
+  cpus=  0(  0c) [  0,  0]
+
+▶ rest ─ util/open/frac=   0.5/ 100/  100.0 prot/prot_preempt=0.00/0.00 tasks=    25
+  sched   tot=   19  dd_sel/enq=63.2/15.8 dsq/10s=0.00/0.00 wake/exp/re=21.1/0.00/0.00
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign=0.00/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=5.26 xnuma=0.00 xllc/skip=0.00/0.00 open_idle=0.00 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.00/0.00 llc_drain/try=0.00/0.00 skip_rnode=0.00
+  cpus=  0(  0c) [  0,  0]
+━━ Tue, 10 Nov 2026 00:55:29 +0100 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tot=1879144 local_sel/enq=0.25/0.01 open_idle=0.03 affn_viol=0.00 hi/lo=0.00/0.01
+busy= 19.3 util/hi/lo=  292.5/0.00/0.10 fb_cpus=[5]/util= 0.0 proc=48ms sys_util_10s=  9.6
+excl_coll=0.00 excl_preempt=0.00 excl_idle=0.00 excl_wakeup=0.00
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+gpu_tasks_affinitized=0 gpu_task_affinitization_time=0
+
+▶ drn ─ util/open/frac= 282.7/27.0/   96.7 prot/prot_preempt=59.7/59.1 tasks=     9
+  sched   tot=  1.9m dd_sel/enq=0.05/0.00 dsq/10s= 100/49.6 wake/exp/re=0.01/ 100/0.01
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign= 100/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=53.3 xnuma=0.00 xllc/skip=0.01/60.6 open_idle=0.00 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.01/0.00 llc_drain/try=0.01/0.01 skip_rnode=0.00
+  cpus=  4(  4c) [  0,  4]
+  N0 L00: ░███|█░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]55.8/ 0.0 [01]44.2/ 0.0 [02]0.01/40.4
+
+▶ rest ─ util/open/frac=   9.7/61.3/    3.3 prot/prot_preempt=0.00/0.00 tasks=    40
+  sched   tot=  6.4k dd_sel/enq=58.8/2.10 dsq/10s=35.5/18.2 wake/exp/re=38.9/0.20/0.00
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign=0.19/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=19.8 xnuma=0.00 xllc/skip=0.75/0.00 open_idle=10.2 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.52/0.08 llc_drain/try=0.03/0.13 skip_rnode=0.00
+  cpus=  1(  1c) [  0,  1]
+  N0 L00: █░░░|░░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]99.2/ 0.1 [01]0.44/ 1.3 [02]0.09/ 0.5 [03]0.31/ 3.0
+━━ Tue, 10 Nov 2026 00:55:34 +0100 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tot=3533663 local_sel/enq=0.16/0.01 open_idle=0.01 affn_viol=0.00 hi/lo=0.00/0.00
+busy= 26.3 util/hi/lo=  388.8/0.00/0.00 fb_cpus=[5]/util= 0.0 proc=28ms sys_util_10s= 18.0
+excl_coll=0.00 excl_preempt=0.00 excl_idle=0.00 excl_wakeup=0.00
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+gpu_tasks_affinitized=0 gpu_task_affinitization_time=0
+
+▶ drn ─ util/open/frac= 376.6/3.03/   96.9 prot/prot_preempt=97.0/97.0 tasks=     8
+  sched   tot=  3.5m dd_sel/enq=0.00/0.00 dsq/10s= 100/74.8 wake/exp/re=0.00/ 100/0.01
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign= 100/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=51.7 xnuma=0.00 xllc/skip=0.01/9.23 open_idle=0.00 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.00/0.00 llc_drain/try=0.00/0.00 skip_rnode=0.00
+  cpus=  4(  4c) [  4,  4]
+  N0 L00: ░███|█░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]59.7/ 0.0 [01]40.3/ 0.0
+
+▶ rest ─ util/open/frac=  12.2/32.4/    3.1 prot/prot_preempt=0.00/0.00 tasks=    43
+  sched   tot= 10.9k dd_sel/enq=50.5/0.28 dsq/10s=48.6/33.6 wake/exp/re=49.2/0.00/0.00
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign=0.03/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=15.7 xnuma=0.00 xllc/skip=0.70/0.00 open_idle=1.03 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.22/0.09 llc_drain/try=0.00/0.27 skip_rnode=0.00
+  cpus=  1(  1c) [  1,  1]
+  N0 L00: █░░░|░░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]99.5/ 0.1 [01]0.38/ 0.9 [02]0.13/ 0.4 [03]0.04/ 2.8
+━━ Tue, 10 Nov 2026 00:55:39 +0100 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tot=3398150 local_sel/enq=0.16/0.01 open_idle=0.01 affn_viol=0.00 hi/lo=0.00/0.00
+busy= 26.3 util/hi/lo=  386.5/0.00/0.00 fb_cpus=[5]/util= 0.0 proc=28ms sys_util_10s= 22.1
+excl_coll=0.00 excl_preempt=0.00 excl_idle=0.00 excl_wakeup=0.00
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+gpu_tasks_affinitized=0 gpu_task_affinitization_time=0
+
+▶ drn ─ util/open/frac= 374.3/3.04/   96.8 prot/prot_preempt=97.0/97.0 tasks=     8
+  sched   tot=  3.4m dd_sel/enq=0.00/0.00 dsq/10s= 100/87.4 wake/exp/re=0.00/ 100/0.01
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign= 100/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=46.4 xnuma=0.00 xllc/skip=0.01/9.24 open_idle=0.00 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.00/0.00 llc_drain/try=0.00/0.00 skip_rnode=0.00
+  cpus=  4(  4c) [  4,  4]
+  N0 L00: ░███|█░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]58.2/ 0.0 [01]41.8/ 0.0
+
+▶ rest ─ util/open/frac=  12.2/32.0/    3.2 prot/prot_preempt=0.00/0.00 tasks=    43
+  sched   tot= 10.9k dd_sel/enq=50.5/0.28 dsq/10s=48.7/41.2 wake/exp/re=49.2/0.01/0.01
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign=0.06/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=15.7 xnuma=0.00 xllc/skip=0.67/0.00 open_idle=1.05 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.18/0.01 llc_drain/try=0.00/0.25 skip_rnode=0.00
+  cpus=  1(  1c) [  1,  1]
+  N0 L00: █░░░|░░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]99.4/ 0.1 [01]0.45/ 0.5 [02]0.09/ 0.4 [03]0.04/ 2.7
+━━ Tue, 10 Nov 2026 00:55:44 +0100 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tot=3410793 local_sel/enq=0.16/0.01 open_idle=0.01 affn_viol=0.00 hi/lo=0.00/0.00
+busy= 26.4 util/hi/lo=  379.5/0.00/0.00 fb_cpus=[5]/util= 0.0 proc=25ms sys_util_10s= 24.3
+excl_coll=0.00 excl_preempt=0.00 excl_idle=0.00 excl_wakeup=0.00
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+gpu_tasks_affinitized=0 gpu_task_affinitization_time=0
+
+▶ drn ─ util/open/frac= 367.6/3.02/   96.9 prot/prot_preempt=97.0/97.0 tasks=     9
+  sched   tot=  3.4m dd_sel/enq=0.00/0.00 dsq/10s= 100/93.8 wake/exp/re=0.00/ 100/0.01
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign= 100/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=46.6 xnuma=0.00 xllc/skip=0.01/8.55 open_idle=0.00 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.00/0.00 llc_drain/try=0.00/0.00 skip_rnode=0.00
+  cpus=  4(  4c) [  4,  4]
+  N0 L00: ░███|█░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]58.2/ 0.0 [01]41.8/ 0.0
+
+▶ rest ─ util/open/frac=  11.9/30.5/    3.1 prot/prot_preempt=0.00/0.00 tasks=    42
+  sched   tot= 10.9k dd_sel/enq=50.7/0.19 dsq/10s=48.8/45.2 wake/exp/re=49.1/0.00/0.00
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign=0.01/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=14.8 xnuma=0.00 xllc/skip=0.64/0.00 open_idle=1.02 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.02/0.01 llc_drain/try=0.00/0.21 skip_rnode=0.00
+  cpus=  1(  1c) [  1,  1]
+  N0 L00: █░░░|░░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]99.6/ 0.1 [01]0.23/ 0.4 [02]0.15/ 0.3 [03]0.04/ 2.5
+━━ Tue, 10 Nov 2026 00:55:49 +0100 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tot=3389591 local_sel/enq=0.16/0.01 open_idle=0.01 affn_viol=0.00 hi/lo=0.00/0.00
+busy= 26.3 util/hi/lo=  385.9/0.00/0.00 fb_cpus=[5]/util= 0.0 proc=30ms sys_util_10s= 25.3
+excl_coll=0.00 excl_preempt=0.00 excl_idle=0.00 excl_wakeup=0.00
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+gpu_tasks_affinitized=0 gpu_task_affinitization_time=0
+
+▶ drn ─ util/open/frac= 373.7/3.02/   96.9 prot/prot_preempt=97.0/97.0 tasks=     9
+  sched   tot=  3.4m dd_sel/enq=0.00/0.00 dsq/10s= 100/96.9 wake/exp/re=0.00/ 100/0.01
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign= 100/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=45.8 xnuma=0.00 xllc/skip=0.01/9.54 open_idle=0.00 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.00/0.00 llc_drain/try=0.00/0.00 skip_rnode=0.00
+  cpus=  4(  4c) [  4,  4]
+  N0 L00: ░███|█░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]58.3/ 0.0 [01]41.7/ 0.0
+
+▶ rest ─ util/open/frac=  12.1/32.5/    3.1 prot/prot_preempt=0.00/0.00 tasks=    42
+  sched   tot= 10.9k dd_sel/enq=50.8/0.17 dsq/10s=48.8/47.1 wake/exp/re=49.1/0.00/0.00
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign=0.01/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=16.1 xnuma=0.00 xllc/skip=0.70/0.00 open_idle=1.05 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.03/0.00 llc_drain/try=0.00/0.23 skip_rnode=0.00
+  cpus=  1(  1c) [  1,  1]
+  N0 L00: █░░░|░░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]99.4/ 0.1 [01]0.40/ 0.2 [02]0.09/ 0.3 [03]0.08/ 2.2
+━━ Tue, 10 Nov 2026 00:55:54 +0100 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tot=3404556 local_sel/enq=0.16/0.01 open_idle=0.01 affn_viol=0.00 hi/lo=0.00/0.00
+busy= 26.3 util/hi/lo=  386.3/0.00/0.00 fb_cpus=[5]/util= 0.0 proc=25ms sys_util_10s= 25.8
+excl_coll=0.00 excl_preempt=0.00 excl_idle=0.00 excl_wakeup=0.00
+skip_preempt=0 antistall=0 fixup_vtime=0 preempting_mismatch=0
+gpu_tasks_affinitized=0 gpu_task_affinitization_time=0
+
+▶ drn ─ util/open/frac= 374.3/3.02/   96.9 prot/prot_preempt=97.0/97.0 tasks=     9
+  sched   tot=  3.4m dd_sel/enq=0.00/0.00 dsq/10s= 100/98.5 wake/exp/re=0.00/ 100/0.01
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign= 100/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=46.2 xnuma=0.00 xllc/skip=0.01/8.90 open_idle=0.00 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.00/0.00 llc_drain/try=0.00/0.00 skip_rnode=0.00
+  cpus=  4(  4c) [  4,  4]
+  N0 L00: ░███|█░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]58.3/ 0.0 [01]41.7/ 0.0
+
+▶ rest ─ util/open/frac=  12.0/30.5/    3.1 prot/prot_preempt=0.00/0.00 tasks=    42
+  sched   tot= 10.9k dd_sel/enq=50.8/0.16 dsq/10s=48.8/48.0 wake/exp/re=49.1/0.00/0.00
+  exec    keep/max/busy=0.00/0.00/0.00 yield/ign=0.01/    0  slc=20ms min_ex=0.00/0.0ms
+  mig     mig=15.1 xnuma=0.00 xllc/skip=0.70/0.00 open_idle=1.04 affn_viol=0.00
+  preempt preempt/first/xllc/xnuma/idle/fail=0.00/0.00/0.00/0.00/0.00/0.00
+  xlayer  wake/re=0.04/0.01 llc_drain/try=0.00/0.26 skip_rnode=0.00
+  cpus=  1(  1c) [  1,  1]
+  N0 L00: █░░░|░░░░|░░░░|░░░░
+  LLC sched%/lat_ms
+  [00]99.5/ 0.1 [01]0.26/ 0.2 [02]0.15/ 0.2 [03]0.11/ 1.9
+EXIT: unregistered from user space
+[2m2026-11-09T23:55:56.982659Z[0m [32m INFO[0m ThreadId(01) [2mscx_layered[0m[2m:[0m [2mscheds/rust/scx_layered/src/main.rs[0m[2m:[0m[2m4629:[0m Unregister scx_layered scheduler
+
+thread '<unnamed>' (330) panicked at scheds/rust/scx_layered/src/stats.rs:857:29:
+called `Result::unwrap()` on an `Err` value: RecvError
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

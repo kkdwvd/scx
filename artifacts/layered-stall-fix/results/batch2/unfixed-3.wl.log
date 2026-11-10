@@ -1,0 +1,31 @@
+t= 1 wakes=1044 late(>1s)=0 max_lat_ms=6.071
+t= 2 wakes=2094 late(>1s)=0 max_lat_ms=10.202
+t= 3 wakes=3139 late(>1s)=0 max_lat_ms=10.202
+t= 4 wakes=4195 late(>1s)=0 max_lat_ms=10.202
+t= 5 wakes=5258 late(>1s)=0 max_lat_ms=10.202
+t= 6 wakes=6320 late(>1s)=0 max_lat_ms=10.202
+t= 7 wakes=7381 late(>1s)=0 max_lat_ms=10.202
+t= 8 wakes=8442 late(>1s)=0 max_lat_ms=10.202
+t= 9 wakes=9501 late(>1s)=0 max_lat_ms=10.202
+t=10 wakes=10561 late(>1s)=0 max_lat_ms=10.202
+t=11 wakes=11622 late(>1s)=0 max_lat_ms=10.202
+t=12 wakes=12681 late(>1s)=0 max_lat_ms=10.202
+t=13 wakes=13742 late(>1s)=0 max_lat_ms=10.202
+t=14 wakes=14797 late(>1s)=0 max_lat_ms=10.202
+t=15 wakes=15849 late(>1s)=0 max_lat_ms=10.202
+t=16 wakes=16909 late(>1s)=0 max_lat_ms=10.202
+t=17 wakes=17969 late(>1s)=0 max_lat_ms=10.202
+t=18 wakes=19027 late(>1s)=0 max_lat_ms=10.202
+t=19 wakes=20087 late(>1s)=0 max_lat_ms=10.202
+t=20 wakes=21149 late(>1s)=0 max_lat_ms=10.202
+t=21 wakes=22206 late(>1s)=0 max_lat_ms=10.202
+t=22 wakes=23268 late(>1s)=0 max_lat_ms=10.202
+t=23 wakes=24328 late(>1s)=0 max_lat_ms=10.202
+t=24 wakes=25382 late(>1s)=0 max_lat_ms=10.202
+t=25 wakes=26439 late(>1s)=0 max_lat_ms=10.202
+t=26 wakes=27499 late(>1s)=0 max_lat_ms=10.202
+t=27 wakes=28563 late(>1s)=0 max_lat_ms=10.202
+t=28 wakes=29623 late(>1s)=0 max_lat_ms=10.202
+t=29 wakes=30686 late(>1s)=0 max_lat_ms=10.202
+t=30 wakes=31734 late(>1s)=0 max_lat_ms=10.202
+RESULT wakes=31735 late(>1s)=0 max_lat_ms=10.202
