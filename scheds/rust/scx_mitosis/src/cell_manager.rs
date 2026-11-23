@@ -3906,23 +3906,50 @@ mod tests {
 
     #[test]
     fn test_compute_subcell_cpu_assignments_runs_small_cell_as_subcell_zero() {
-        let domain = cpumask_from_cpulist(32, "5");
-        let recipients = vec![
-            CpuRecipient::unpinned(0, 1.0, &domain),
-            CpuRecipient::unpinned(1, 1.0, &domain),
-        ];
         let cpu_to_llc: HashMap<usize, usize> = (0..32).map(|cpu| (cpu, cpu / 4)).collect();
 
-        let assignments =
-            CellManager::compute_subcell_cpu_assignments(&domain, &recipients, true, &cpu_to_llc)
-                .unwrap();
+        for (cpulist, nr_subcells) in [("5", 2), ("5", 8), ("4-6", 4)] {
+            let domain = cpumask_from_cpulist(32, cpulist);
+            // Subcell 0 is not the first recipient, and it is the one kept.
+            let recipients: Vec<CpuRecipient> = (0..nr_subcells)
+                .rev()
+                .map(|id| CpuRecipient::unpinned(id, 1.0, &domain))
+                .collect();
 
-        assert_eq!(assignments.len(), 1);
-        assert_eq!(assignments[0].id, 0);
-        assert_eq!(assignments[0].primary, domain);
-        assert_eq!(
-            assignments[0].borrowable.as_ref().map(|m| m.weight()),
-            Some(0)
+            let assignments = CellManager::compute_subcell_cpu_assignments(
+                &domain,
+                &recipients,
+                true,
+                &cpu_to_llc,
+            )
+            .unwrap();
+
+            assert_eq!(assignments.len(), 1);
+            assert_eq!(assignments[0].id, 0);
+            assert_eq!(assignments[0].primary, domain);
+            assert_eq!(
+                assignments[0].borrowable.as_ref().map(|m| m.weight()),
+                Some(0)
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_subcell_cpu_assignments_small_cell_needs_subcell_zero() {
+        let domain = cpumask_from_cpulist(32, "5");
+        let recipients = vec![
+            CpuRecipient::unpinned(1, 1.0, &domain),
+            CpuRecipient::unpinned(2, 1.0, &domain),
+        ];
+
+        assert!(
+            CellManager::compute_subcell_cpu_assignments(
+                &domain,
+                &recipients,
+                true,
+                &HashMap::new()
+            )
+            .is_err()
         );
     }
 

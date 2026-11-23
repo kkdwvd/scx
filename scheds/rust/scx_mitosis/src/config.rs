@@ -680,4 +680,19 @@ mod tests {
 
         assert_eq!(resolution.cell_assignments.len(), 2);
     }
+
+    #[test]
+    fn recognizes_a_read_from_a_removed_cgroup() {
+        let read_error = |errno| {
+            Err::<(), _>(std::io::Error::from_raw_os_error(errno))
+                .context("reading /sys/fs/cgroup/gone/cpuset.cpus")
+                .unwrap_err()
+        };
+
+        assert!(is_removed_cgroup(&read_error(libc::ENODEV)));
+        assert!(!is_removed_cgroup(&read_error(libc::EACCES)));
+        assert!(!is_removed_cgroup(&anyhow::anyhow!(
+            "failed to parse cpuset"
+        )));
+    }
 }

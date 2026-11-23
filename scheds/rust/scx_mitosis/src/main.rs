@@ -2526,8 +2526,12 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CpuAssignment, Cpumask, Opts, validate_subcell_assignments};
+    use super::{
+        CellManager, CpuAssignment, CpuRecipient, Cpumask, MAX_SUBCELLS_PER_CELL, Opts,
+        SHARE_SIBLING_SUBCELL_CPUS, validate_subcell_assignments,
+    };
     use clap::Parser;
+    use std::collections::HashMap;
 
     fn cpumask(cpus: &[usize]) -> Cpumask {
         let mut mask = Cpumask::new();
@@ -2607,5 +2611,40 @@ mod tests {
         let subcells = [assignment(0, &[0, 1, 2], None)];
 
         assert!(validate_subcell_assignments(&cell, &subcells, false).is_err());
+    }
+
+    /// apply_cell_config() validates whatever the subcell split returns, so
+    /// the split of every cell size has to pass, including a cell with fewer
+    /// CPUs than subcells.
+    #[test]
+    fn accepts_the_subcell_split_of_any_cell_size() {
+        let no_llcs = HashMap::new();
+        let llcs: HashMap<usize, usize> = (0..16).map(|cpu| (cpu, cpu / 4)).collect();
+
+        for cpu_to_llc in [&no_llcs, &llcs] {
+            for nr_cpus in 1..=12 {
+                for nr_subcells in 1..=MAX_SUBCELLS_PER_CELL {
+                    let cpus: Vec<usize> = (0..nr_cpus).collect();
+                    let cell = assignment(2, &cpus, None);
+                    let recipients: Vec<CpuRecipient> = (0..nr_subcells as u32)
+                        .map(|id| CpuRecipient::unpinned(id, 1.0, &cell.primary))
+                        .collect();
+
+                    let subcells = CellManager::compute_subcell_cpu_assignments(
+                        &cell.primary,
+                        &recipients,
+                        SHARE_SIBLING_SUBCELL_CPUS,
+                        cpu_to_llc,
+                    )
+                    .unwrap();
+
+                    if let Err(e) =
+                        validate_subcell_assignments(&cell, &subcells, SHARE_SIBLING_SUBCELL_CPUS)
+                    {
+                        panic!("{nr_subcells} subcells on {nr_cpus} CPUs: {e}");
+                    }
+                }
+            }
+        }
     }
 }
