@@ -704,4 +704,77 @@ mod tests {
             "failed to parse cpuset"
         )));
     }
+
+    /// A restarting container: its new cgroup exists next to the old one with
+    /// the same cpuset, and only the old one has measured demand. Each cell
+    /// keeps a CPU for each of its subcells.
+    #[test]
+    fn restarting_cgroup_keeps_a_cpu_per_subcell() {
+        let config = write_config(
+            r#"
+            [
+              {
+                "name": "job",
+                "matches": { "CgroupContains": "job-" },
+                "subcells": [
+                  { "name": "worker", "matches": [[{ "CommPrefix": "worker" }]] },
+                  { "name": "rest", "matches": [[]] }
+                ]
+              },
+              { "name": "rest", "matches": {} }
+            ]
+            "#,
+        );
+        scx_utils::set_cpumask_test_width(16);
+        let all_cpus = Cpumask::from_cpulist("0-15").unwrap();
+        let root = TempDir::new().unwrap();
+        for cgroup in ["job-old", "job-new"] {
+            fs::create_dir(root.path().join(cgroup)).unwrap();
+            fs::write(root.path().join(cgroup).join("cpuset.cpus"), "0-7\n").unwrap();
+        }
+
+        let mut configured = ConfiguredCells::load_with_root(
+            config.path(),
+            root.path().to_path_buf(),
+            256,
+            all_cpus,
+        )
+        .unwrap();
+        configured.resolve(None, 2).unwrap();
+        let cell_id = |configured: &ConfiguredCells, cgroup: &str| {
+            *configured
+                .path_cell_ids
+                .iter()
+                .find(|(path, _)| path.ends_with(cgroup))
+                .unwrap()
+                .1
+        };
+        let (old, new) = (
+            cell_id(&configured, "job-old"),
+            cell_id(&configured, "job-new"),
+        );
+
+        // The new cell is not in the demand map yet, as on its first resolve.
+        let demands = HashMap::from([(0, 5.0), (old, 80.0)]);
+        let resolution = configured.resolve(Some(&demands), 2).unwrap();
+        let (assignments, _) =
+            crate::cell_manager::CellManager::compute_configured_cell_cpu_assignments(
+                configured.all_cpus(),
+                &resolution.cell_recipients,
+                false,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let cpus = |id: u32| {
+            assignments
+                .iter()
+                .find(|assignment| assignment.id == id)
+                .unwrap()
+                .primary
+                .weight()
+        };
+
+        assert_eq!(cpus(new), 2);
+        assert_eq!(cpus(old), 6);
+    }
 }

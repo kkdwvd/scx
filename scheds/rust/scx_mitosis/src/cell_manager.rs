@@ -4037,6 +4037,148 @@ mod tests {
         );
     }
 
+    /// Two cells claim the same CPUs, as the old and the new cgroup of a
+    /// restarting container do. The weighted split leaves the one without
+    /// demand a single CPU unless it prefers more.
+    #[test]
+    fn test_preferred_minimum_covers_contested_claims() {
+        let domain = cpumask_for_range(8);
+        let split = |preferred: usize| {
+            let recipients = vec![
+                CpuRecipient::pinned(1, 80.0, &domain).with_preferred_minimum(preferred),
+                CpuRecipient::pinned(2, 1.0, &domain).with_preferred_minimum(preferred),
+            ];
+            let assignments =
+                CellManager::compute_cpu_assignments_for(&domain, &recipients, false).unwrap();
+            (
+                find_assignment(&assignments, 1).primary.weight(),
+                find_assignment(&assignments, 2).primary.weight(),
+            )
+        };
+
+        assert_eq!(split(1), (7, 1));
+        assert_eq!(split(2), (6, 2));
+        assert_eq!(split(3), (5, 3));
+    }
+
+    #[test]
+    fn test_preferred_minimum_is_soft_and_yields_to_protected_minimums() {
+        // Three CPUs cannot give both claimants two: no error, and each
+        // keeps its protected CPU.
+        let domain = cpumask_for_range(3);
+        let recipients = vec![
+            CpuRecipient::pinned(1, 1.0, &domain).with_preferred_minimum(2),
+            CpuRecipient::pinned(2, 1.0, &domain).with_preferred_minimum(2),
+        ];
+        let assignments =
+            CellManager::compute_cpu_assignments_for(&domain, &recipients, false).unwrap();
+        let mut sizes = [
+            find_assignment(&assignments, 1).primary.weight(),
+            find_assignment(&assignments, 2).primary.weight(),
+        ];
+        sizes.sort();
+        assert_eq!(sizes, [1, 2]);
+
+        // Two CPUs and two claimants: the one preferring three does not take
+        // the other's protected CPU.
+        let domain = cpumask_for_range(2);
+        let recipients = vec![
+            CpuRecipient::pinned(1, 100.0, &domain).with_preferred_minimum(3),
+            CpuRecipient::pinned(2, 0.0, &domain),
+        ];
+        let assignments =
+            CellManager::compute_cpu_assignments_for(&domain, &recipients, false).unwrap();
+        assert_eq!(find_assignment(&assignments, 1).primary.weight(), 1);
+        assert_eq!(find_assignment(&assignments, 2).primary.weight(), 1);
+    }
+
+    /// Cell 0's requested minimum takes from the cell that stays above its
+    /// preferred minimum, not one CPU from each cell in turn.
+    #[test]
+    fn test_requested_minimum_spares_cells_at_their_preferred_minimum() {
+        let domain = cpumask_for_range(16);
+        let cpu_to_llc = (0..16).map(|cpu| (cpu, cpu / 4)).collect();
+        let split = |preferred: usize| {
+            let recipients = vec![
+                CpuRecipient::root(0, 1.0, &domain, 2),
+                CpuRecipient::pinned(1, 1.0, &cpumask_from_cpulist(16, "0-11"))
+                    .with_preferred_minimum(preferred),
+                CpuRecipient::pinned(2, 1.0, &cpumask_from_cpulist(16, "12-13"))
+                    .with_preferred_minimum(preferred),
+                CpuRecipient::pinned(3, 1.0, &cpumask_from_cpulist(16, "14-15"))
+                    .with_preferred_minimum(preferred),
+            ];
+            let (assignments, _) = CellManager::compute_configured_cell_cpu_assignments(
+                &domain,
+                &recipients,
+                false,
+                &cpu_to_llc,
+            )
+            .unwrap();
+            [0, 1, 2, 3].map(|id| find_assignment(&assignments, id).primary.weight())
+        };
+
+        // Without a preferred minimum the second CPU comes from a small cell.
+        let sizes = split(1);
+        assert_eq!((sizes[0], sizes[1]), (2, 11));
+        assert_eq!(sizes[2] + sizes[3], 3);
+
+        assert_eq!(split(2), [2, 10, 2, 2]);
+    }
+
+    /// When no cell is above its preferred minimum, cell 0 still gets its
+    /// requested minimum, down to the protected minimum of the cells.
+    #[test]
+    fn test_requested_minimum_falls_back_to_protected_minimums() {
+        let domain = cpumask_for_range(4);
+        let cpu_to_llc = (0..4).map(|cpu| (cpu, 0)).collect();
+        let recipients = vec![
+            CpuRecipient::root(0, 1.0, &domain, 2),
+            CpuRecipient::pinned(1, 1.0, &cpumask_from_cpulist(4, "0-1")).with_preferred_minimum(2),
+            CpuRecipient::pinned(2, 1.0, &cpumask_from_cpulist(4, "2-3")).with_preferred_minimum(2),
+        ];
+        let (assignments, _) = CellManager::compute_configured_cell_cpu_assignments(
+            &domain,
+            &recipients,
+            false,
+            &cpu_to_llc,
+        )
+        .unwrap();
+
+        assert_eq!(find_assignment(&assignments, 0).primary.weight(), 2);
+        assert_eq!(find_assignment(&assignments, 1).primary.weight(), 1);
+        assert_eq!(find_assignment(&assignments, 2).primary.weight(), 1);
+    }
+
+    #[test]
+    fn test_preferred_minimum_covers_unpinned_recipients() {
+        let domain = cpumask_for_range(12);
+        let cpu_to_llc = (0..12).map(|cpu| (cpu, cpu / 4)).collect();
+        let split = |nr_cpus: usize, preferred: usize| {
+            let domain = cpumask_from_cpulist(12, &format!("0-{}", nr_cpus - 1));
+            let recipients = vec![
+                CpuRecipient::root(0, 1.0, &domain, 2),
+                CpuRecipient::unpinned(1, 100.0, &domain),
+                CpuRecipient::unpinned(2, 0.0, &domain).with_preferred_minimum(preferred),
+            ];
+            let (assignments, _) = CellManager::compute_configured_cell_cpu_assignments(
+                &domain,
+                &recipients,
+                false,
+                &cpu_to_llc,
+            )
+            .unwrap();
+            [0, 1, 2].map(|id| find_assignment(&assignments, id).primary.weight())
+        };
+        let _ = domain;
+
+        assert_eq!(split(12, 1), [2, 9, 1]);
+        assert_eq!(split(12, 3), [2, 7, 3]);
+        // Four CPUs: two for cell 0, and the other unpinned cell still gets
+        // its CPU.
+        assert_eq!(split(4, 3), [2, 1, 1]);
+    }
+
     #[test]
     fn test_compute_subcell_cpu_assignments_prefers_full_llc_chunks() {
         let domain = cpumask_from_cpulist(32, "0-15");
